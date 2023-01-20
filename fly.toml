@@ -1,12 +1,15 @@
 # https://fly.io/docs/reference/configuration
 
-app = "dagger-registry"
+app = "dagger-registry-2023-01-23"
 kill_signal = "SIGINT"
-kill_timeout = 5
+# Wait these many seconds for existing connections to drain before hard killing
+kill_timeout = 30
 processes = []
 
-[build]
-  image = "registry.fly.io/dagger-registry"
+# There is no build config since this will always be deployed with a specific
+# --image flag. This is currently a pipeline concern. FTW, the app image has
+# the build run embedded in /BUILD_URL file.
+# [build]
 
 [env]
   PORT = "8080"
