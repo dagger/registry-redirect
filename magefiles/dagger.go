@@ -33,8 +33,11 @@ const (
 
 // golangci-lint
 func Lint(ctx context.Context) {
+	defer handleErr()
+
 	d := daggerClient(ctx)
 	defer d.Close()
+
 	lint(ctx, d)
 }
 
@@ -47,18 +50,21 @@ func lint(ctx context.Context, d *dagger.Client) {
 		ExitCode(ctx)
 
 	if err != nil {
-		unavailableErr(err)
+		panic(unavailableErr(err))
 	}
 
 	if exitCode != 0 {
-		os.Exit(exitCode)
+		panic(Exit{Code: exitCode, Error: err})
 	}
 }
 
 // go test
 func Test(ctx context.Context) {
+	defer handleErr()
+
 	d := daggerClient(ctx)
 	defer d.Close()
+
 	test(ctx, d)
 }
 
@@ -72,18 +78,21 @@ func test(ctx context.Context, d *dagger.Client) {
 		ExitCode(ctx)
 
 	if err != nil {
-		unavailableErr(err)
+		panic(unavailableErr(err))
 	}
 
 	if exitCode != 0 {
-		os.Exit(exitCode)
+		panic(Exit{Code: exitCode, Error: err})
 	}
 }
 
 // binary artefact used in container image
 func Build(ctx context.Context) {
+	defer handleErr()
+
 	d := daggerClient(ctx)
 	defer d.Close()
+
 	_ = build(ctx, d)
 }
 
@@ -98,7 +107,7 @@ func build(ctx context.Context, d *dagger.Client) *dagger.File {
 
 	_, err := buildBinary.ExitCode(ctx)
 	if err != nil {
-		createErr(err)
+		panic(createErr(err))
 	}
 
 	return buildBinary.File(binaryPath)
@@ -126,37 +135,41 @@ func deployConfig(d *dagger.Client) *dagger.File {
 
 // Docker client with private registry
 func Auth(ctx context.Context) {
+	defer handleErr()
+
 	d := daggerClient(ctx)
 	defer d.Close()
 
-	flyctl := flyctlWithDockerConfig(ctx, d)
-	authDocker(ctx, d, flyctl)
-}
-
-func authDocker(ctx context.Context, d *dagger.Client, c *dagger.Container) {
 	githubRef := os.Getenv("GITHUB_REF_NAME")
 	if githubRef != "" && githubRef == "main" {
-		hostDockerConfigDir := os.Getenv("DOCKER_CONFIG")
-		if hostDockerConfigDir == "" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				readErr(err)
-			}
-			hostDockerConfigDir = filepath.Join(home, ".docker")
-		}
-		hostDockerClientConfig := filepath.Join(hostDockerConfigDir, "config.json")
-
-		_, err := c.File(".docker/config.json").Export(ctx, hostDockerClientConfig)
-		if err != nil {
-			createErr(err)
-		}
+		flyctl := flyctlWithDockerConfig(ctx, d)
+		authDocker(ctx, d, flyctl)
 	} else {
 		fmt.Println("\n🐳 Docker auth runs only in CI, main branch")
 	}
 }
 
+func authDocker(ctx context.Context, d *dagger.Client, c *dagger.Container) {
+	hostDockerConfigDir := os.Getenv("DOCKER_CONFIG")
+	if hostDockerConfigDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			panic(readErr(err))
+		}
+		hostDockerConfigDir = filepath.Join(home, ".docker")
+	}
+	hostDockerClientConfig := filepath.Join(hostDockerConfigDir, "config.json")
+
+	_, err := c.File(".docker/config.json").Export(ctx, hostDockerClientConfig)
+	if err != nil {
+		panic(createErr(err))
+	}
+}
+
 // container image to private registry
 func Publish(ctx context.Context) {
+	defer handleErr()
+
 	d := daggerClient(ctx)
 	defer d.Close()
 
@@ -178,12 +191,14 @@ func publish(ctx context.Context, d *dagger.Client) string {
 
 // zero-downtime deploy container image
 func Deploy(ctx context.Context) {
+	defer handleErr()
+
 	d := daggerClient(ctx)
 	defer d.Close()
 
 	imageRef, err := hostEnv(ctx, d.Host(), "IMAGE_REF").Value(ctx)
 	if err != nil {
-		misconfigureErr(err)
+		panic(misconfigureErr(err))
 	}
 
 	deploy(ctx, d, imageRef)
@@ -194,7 +209,7 @@ func deploy(ctx context.Context, d *dagger.Client, imageRef string) {
 	if githubRef != "" && githubRef == "main" {
 		imageRefFlyValid, err := reference.ParseDockerRef(imageRef)
 		if err != nil {
-			misconfigureErr(err)
+			panic(misconfigureErr(err))
 		}
 
 		flyctl := flyctlWithDockerConfig(ctx, d)
@@ -202,10 +217,10 @@ func deploy(ctx context.Context, d *dagger.Client, imageRef string) {
 
 		exitCode, err := flyctl.ExitCode(ctx)
 		if err != nil {
-			unavailableErr(err)
+			panic(unavailableErr(err))
 		}
 		if exitCode != 0 {
-			os.Exit(exitCode)
+			panic(Exit{Code: exitCode, Error: err})
 		}
 	} else {
 		fmt.Println("\n🎁 Deploying runs only in CI, main branch")
@@ -217,6 +232,8 @@ func All(ctx context.Context) {
 	// TODO: re-use the same client, run in parallel with err.Go
 	mg.CtxDeps(ctx, Lint, Test, Auth)
 
+	defer handleErr()
+
 	d := daggerClient(ctx)
 	defer d.Close()
 
@@ -226,6 +243,8 @@ func All(ctx context.Context) {
 
 // stream app logs
 func Logs(ctx context.Context) {
+	defer handleErr()
+
 	d := daggerClient(ctx)
 	defer d.Close()
 
@@ -237,14 +256,14 @@ func Logs(ctx context.Context) {
 		Stdout(ctx)
 
 	if err != nil {
-		unavailableErr(err)
+		panic(unavailableErr(err))
 	}
 }
 
 func daggerClient(ctx context.Context) *dagger.Client {
 	client, err := dagger.Connect(ctx, dagger.WithLogOutput(os.Stderr))
 	if err != nil {
-		unavailableErr(err)
+		panic(unavailableErr(err))
 	}
 	return client
 }
@@ -274,7 +293,7 @@ func publishImage(ctx context.Context, d *dagger.Client, binary *dagger.File) st
 		Publish(ctx, ref)
 
 	if err != nil {
-		unavailableErr(err)
+		panic(unavailableErr(err))
 	}
 
 	return refWithSHA
@@ -331,11 +350,11 @@ func flyctlWithDockerConfig(ctx context.Context, d *dagger.Client) *dagger.Conta
 	exitCode, err := flyctl.ExitCode(ctx)
 
 	if err != nil {
-		createErr(err)
+		panic(createErr(err))
 	}
 
 	if exitCode != 0 {
-		createErr(errors.New("Failed to add registry.fly.io as a Docker authenticated registry"))
+		panic(createErr(errors.New("Failed to add registry.fly.io as a Docker authenticated registry")))
 	}
 
 	return flyctl
@@ -358,28 +377,42 @@ func hostEnv(ctx context.Context, host *dagger.Host, varName string) *dagger.Hos
 	hostEnv := host.EnvVariable(varName)
 	hostEnvVal, err := hostEnv.Value(ctx)
 	if err != nil {
-		unavailableErr(err)
+		panic(readErr(err))
 	}
 	if hostEnvVal == "" {
-		misconfigureErr(errors.New(fmt.Sprintf("💥 env var %s must be set\n", varName)))
+		panic(misconfigureErr(errors.New(fmt.Sprintf("💥 env var %s must be set\n", varName))))
 	}
 	return hostEnv
 }
 
+type Exit struct {
+	Code  int
+	Error error
+}
+
+func handleErr() {
+	if e := recover(); e != nil {
+		if exit, ok := e.(Exit); ok == true {
+			fmt.Fprintf(os.Stderr, "%s\nsysexits(3) error code %d\n", exit.Error.Error(), exit.Code)
+			os.Exit(exit.Code)
+		}
+		panic(e) // not an Exit, pass-through
+	}
+}
+
 // https://man.openbsd.org/sysexits
-func readErr(err error) {
-	fmt.Fprintf(os.Stderr, err.Error())
-	os.Exit(66)
+func readErr(err error) Exit {
+	return Exit{Code: 65, Error: err}
 }
-func unavailableErr(err error) {
-	fmt.Fprintf(os.Stderr, err.Error())
-	os.Exit(69)
+
+func unavailableErr(err error) Exit {
+	return Exit{Code: 69, Error: err}
 }
-func createErr(err error) {
-	fmt.Fprintf(os.Stderr, err.Error())
-	os.Exit(73)
+
+func createErr(err error) Exit {
+	return Exit{Code: 73, Error: err}
 }
-func misconfigureErr(err error) {
-	fmt.Fprintf(os.Stderr, err.Error())
-	os.Exit(78)
+
+func misconfigureErr(err error) Exit {
+	return Exit{Code: 78, Error: err}
 }
