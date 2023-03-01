@@ -19,16 +19,31 @@ import (
 const (
 	// https://hub.docker.com/_/golang/tags?page=1&name=alpine
 	alpineVersion = "3.17"
-	goVersion     = "1.19"
+	goVersion     = "1.20"
 
 	// https://github.com/golangci/golangci-lint/releases
-	golangciLintVersion = "1.50.1"
+	golangciLintVersion = "1.51.2"
 
 	// https://hub.docker.com/r/flyio/flyctl/tags
-	flyctlVersion = "0.0.450"
+	flyctlVersion = "0.0.473"
 
 	binaryName = "registry-redirect"
 	_imageName = "registry.fly.io/dagger-registry-2023-01-23"
+
+	InstancesToDeploy = "3"
+	// We want to avoid running multiple instances in the same region
+	// If there are issues with one region, the whole service will be disrupted
+	MaxInstancesPerRegion = "1"
+
+	// https://fly.io/docs/reference/regions/#fly-io-regions
+	Amsterdam = "ams"
+	Chicago   = "ord"
+	Paris     = "cdg"
+	Singapore = "sin"
+	Sunnyvale = "sjc"
+
+	// https://fly.io/docs/reference/configuration/#picking-a-deployment-strategy
+	DeployStrategy = "canary"
 )
 
 // golangci-lint
@@ -141,7 +156,7 @@ func Auth(ctx context.Context) {
 	defer d.Close()
 
 	githubRef := os.Getenv("GITHUB_REF_NAME")
-	if githubRef != "" && githubRef == "main" {
+	if githubRef == "main" {
 		flyctl := flyctlWithDockerConfig(ctx, d)
 		authDocker(ctx, d, flyctl)
 	} else {
@@ -180,7 +195,7 @@ func publish(ctx context.Context, d *dagger.Client) string {
 	binary := build(ctx, d)
 
 	githubRef := os.Getenv("GITHUB_REF_NAME")
-	if githubRef != "" && githubRef == "main" {
+	if githubRef == "main" {
 		return publishImage(ctx, d, binary)
 	} else {
 		fmt.Println("\n📦 Publishing runs only in CI, main branch")
@@ -206,14 +221,27 @@ func Deploy(ctx context.Context) {
 
 func deploy(ctx context.Context, d *dagger.Client, imageRef string) {
 	githubRef := os.Getenv("GITHUB_REF_NAME")
-	if githubRef != "" && githubRef == "main" {
+	if githubRef == "main" {
 		imageRefFlyValid, err := reference.ParseDockerRef(imageRef)
 		if err != nil {
 			panic(misconfigureErr(err))
 		}
 
-		flyctl := flyctlWithDockerConfig(ctx, d)
-		flyctl = flyctl.WithExec([]string{"deploy", "--image", imageRefFlyValid.String()})
+		flyctl := flyctlWithDockerConfig(ctx, d).
+			WithExec([]string{
+				"regions",
+				"set", Amsterdam, Chicago, Paris, Singapore, Sunnyvale,
+			}).
+			WithExec([]string{
+				"scale",
+				"count", InstancesToDeploy,
+				"--max-per-region", MaxInstancesPerRegion,
+			}).
+			WithExec([]string{
+				"deploy",
+				"--image", imageRefFlyValid.String(),
+				"--strategy", DeployStrategy,
+			})
 
 		exitCode, err := flyctl.ExitCode(ctx)
 		if err != nil {

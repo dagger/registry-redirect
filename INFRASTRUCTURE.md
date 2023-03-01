@@ -1,8 +1,8 @@
 This app is deployed to Fly.io as 3 instances:
 
-1. 🇺🇸 San Jose
-2. 🇫🇷 Paris
-3. 🇯🇵 Tokyo
+1. 🇺🇸 Sunnyvale or Chicago
+2. 🇫🇷 Paris or 🇳🇱 Amsterdam
+3. 🇸🇬 Singapore
 
 We are doing this for higher availability & lower edge latency. This is what
 that means for our end-users:
@@ -18,8 +18,8 @@ flowchart LR
     
     subgraph Fly.io
         registry_redirect_usa("🇺🇸 registry.dagger.io/engine")
-        registry_redirect_fr("🇫🇷 registry.dagger.io/engine")
-        registry_redirect_jp("🇯🇵 registry.dagger.io/engine")
+        registry_redirect_fr("🇫🇷 🇳🇱 registry.dagger.io/engine")
+        registry_redirect_jp(" 🇸🇬 registry.dagger.io/engine")
     end
 
     subgraph GitHub
@@ -57,8 +57,5 @@ reponsible for testing, building, publishing & deploying the app.
 - `flyctl config save --app dagger-registry-2023-01-23`
 - Make necessary edits to `fly.toml`
 - Deploy app from local: `GITHUB_REF_NAME=main mage all`
-- `flyctl regions add sjc cdg nrt`
-- `flyctl scale 3`
-- `flyctl regions delete lhr`
 - Configure `registry.dagger.io` A & AAAA DNS record - `flyctl ips list`
 - `flyctl certs create registry.dagger.io`

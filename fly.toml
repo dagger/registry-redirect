@@ -14,9 +14,6 @@ processes = []
 [env]
   PORT = "8080"
 
-[deploy]
-  strategy = "bluegreen"
-
 [experimental]
   auto_rollback = true
   cmd = ["-repo", "dagger"]
