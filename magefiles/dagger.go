@@ -25,7 +25,7 @@ const (
 	golangciLintVersion = "1.51.2"
 
 	// https://hub.docker.com/r/flyio/flyctl/tags
-	flyctlVersion = "0.0.473"
+	flyctlVersion = "0.0.482"
 
 	binaryName = "registry-redirect"
 	_imageName = "registry.fly.io/dagger-registry-2023-01-23"
