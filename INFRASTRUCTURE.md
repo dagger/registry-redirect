@@ -1,6 +1,6 @@
 This app is deployed to Fly.io as 3 instances:
 
-1. 🇺🇸 Sunnyvale
+1. 🇺🇸 Ashburn
 2. 🇫🇷 Paris
 3. 🇸🇬 Singapore
 

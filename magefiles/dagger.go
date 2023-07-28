@@ -38,7 +38,7 @@ const (
 	// https://fly.io/docs/reference/regions/#fly-io-regions
 	Paris     = "cdg"
 	Singapore = "sin"
-	Sunnyvale = "sjc"
+	Ashburn   = "iad"
 
 	// https://fly.io/docs/reference/configuration/#picking-a-deployment-strategy
 	DeployStrategy = "rolling" // Required when MaxInstancesPerRegion set to 1
@@ -175,7 +175,7 @@ func deploy(ctx context.Context, c *dagger.Client, imageRef string) {
 				"scale",
 				"count", InstancesToDeploy,
 				"--max-per-region", MaxInstancesPerRegion,
-				fmt.Sprintf("--region=%s,%s,%s", Sunnyvale, Paris, Singapore),
+				fmt.Sprintf("--region=%s,%s,%s", Ashburn, Paris, Singapore),
 				"--yes",
 			}).
 			Sync(ctx)
@@ -338,7 +338,7 @@ kill_timeout = 30
     grace_period = "1s"
     interval = "5s"
     restart_limit = 0
-    timeout = "4s"`, appName, Sunnyvale)})
+    timeout = "4s"`, appName, Ashburn)})
 
 	return flyctl
 }
