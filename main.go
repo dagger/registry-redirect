@@ -9,11 +9,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
+	"github.com/chainguard-dev/registry-redirect/pkg/logger"
 	"github.com/chainguard-dev/registry-redirect/pkg/redirect"
 	"go.uber.org/zap"
 	"knative.dev/pkg/logging"
@@ -49,6 +52,30 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	syslogHost := os.Getenv("SYSLOG_HOST")
+	if syslogHost == "" {
+		syslogHost = "127.0.0.1:514"
+	}
+
+	appName := os.Getenv("APP_NAME")
+	if appName == "" {
+		appName = "registry-redirect"
+	}
+
+	// Minimum severity of the messages that the logger will log:
+	// info, warning, error and fatal
+	logCfg := logger.Config{
+		Level:     "info",
+		Component: appName,
+		Protocol:  "tcp",
+		Address:   syslogHost,
+	}
+
+	ctx, syslogger, err := logger.NewLogger(ctx, &logCfg)
+	if err != nil {
+		panic(err)
+	}
+
 	logger := logging.FromContext(ctx)
 
 	go func() {
@@ -60,6 +87,7 @@ func main() {
 	if err := serve(ctx, logger); err != nil {
 		logger.Fatalf("failed to serve:+%v\n", err)
 	}
+	syslogger.Close()
 }
 
 func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
@@ -68,8 +96,9 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 	if *gcr {
 		host = "gcr.io"
 	}
+	wg := &sync.WaitGroup{}
 	r := redirect.New(host, *repo, *prefix)
-	http.Handle("/", r)
+	customHandler := NewCustomHandler(wg, r)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -77,8 +106,9 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 	}
 	logger.Info("http server starting...")
 	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%s", port),
-		Handler: nil,
+		Addr:        fmt.Sprintf(":%s", port),
+		Handler:     customHandler,
+		BaseContext: func(_ net.Listener) context.Context { return ctx },
 	}
 	go func() {
 		if err = srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -98,11 +128,28 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 		logger.Fatalf("http server shutdown failed:%+s", err)
 	}
 
+	// Wait for in-flight requests to complete before shutting down
+	wg.Wait()
+
 	logger.Infof("http server shutdown gracefully")
 
 	if err == http.ErrServerClosed {
 		err = nil
 	}
-
 	return
+}
+
+type CustomHandler struct {
+	wg      *sync.WaitGroup
+	handler http.Handler
+}
+
+func NewCustomHandler(wg *sync.WaitGroup, handler http.Handler) *CustomHandler {
+	return &CustomHandler{wg: wg, handler: handler}
+}
+
+func (h *CustomHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.wg.Add(1)
+	defer h.wg.Done()
+	h.handler.ServeHTTP(w, r) // Call your original handler
 }

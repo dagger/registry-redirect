@@ -1,0 +1,2 @@
+export FLY_API_TOKEN="$(flyctl auth token)"
+export GITHUB_REF_NAME=main

@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
 
 	"dagger.io/dagger"
 	"github.com/containers/image/v5/docker/reference"
@@ -21,14 +20,16 @@ const (
 	goVersion     = "1.20"
 
 	// https://github.com/golangci/golangci-lint/releases
-	golangciLintVersion = "1.53.3"
+	golangciLintVersion = "1.54.1"
 
 	// https://hub.docker.com/r/flyio/flyctl/tags
-	flyctlVersion = "0.1.65"
+	flyctlVersion = "0.1.78"
 
-	appName          = "dagger-registry-2023-01-23"
+	appName          = "dagger-registry-2023-07-28"
 	appImageRegistry = "registry.fly.io"
 	binaryName       = "registry-redirect"
+
+	syslogHost = "vector-2023-06-08.internal:514"
 
 	InstancesToDeploy = "3"
 	// We want to avoid running multiple instances in the same region
@@ -41,19 +42,23 @@ const (
 	Ashburn   = "iad"
 
 	// https://fly.io/docs/reference/configuration/#picking-a-deployment-strategy
-	DeployStrategy = "rolling" // Required when MaxInstancesPerRegion set to 1
+	DeployStrategy = "bluegreen" // Required when MaxInstancesPerRegion set to 1
 )
 
 // golangci-lint
 func Lint(ctx context.Context) {
-	c := daggerClient(ctx)
-	defer c.Close()
+	c, ok := ctx.Value("daggerClient").(*dagger.Client)
+	if !ok {
+		c := newDaggerClient(ctx)
+		defer c.Close()
+	}
 
 	lint(ctx, c)
 }
 
 func lint(ctx context.Context, c *dagger.Client) {
 	_, err := c.Container(dagger.ContainerOpts{Platform: dagger.Platform("linux/amd64")}).
+		Pipeline("lint").
 		From(fmt.Sprintf("golangci/golangci-lint:v%s-alpine", golangciLintVersion)).
 		WithMountedCache("/go/pkg/mod", c.CacheVolume("gomod")).
 		WithMountedDirectory("/src", sourceCode(c)).WithWorkdir("/src").
@@ -66,14 +71,18 @@ func lint(ctx context.Context, c *dagger.Client) {
 
 // go test
 func Test(ctx context.Context) {
-	c := daggerClient(ctx)
-	defer c.Close()
+	c, ok := ctx.Value("daggerClient").(*dagger.Client)
+	if !ok {
+		c := newDaggerClient(ctx)
+		defer c.Close()
+	}
 
 	test(ctx, c)
 }
 
 func test(ctx context.Context, c *dagger.Client) {
 	_, err := c.Container(dagger.ContainerOpts{Platform: dagger.Platform("linux/amd64")}).
+		Pipeline("test").
 		From(fmt.Sprintf("golang:%s-alpine%s", goVersion, alpineVersion)).
 		WithMountedDirectory("/src", sourceCode(c)).WithWorkdir("/src").
 		WithMountedCache("/go/pkg/mod", c.CacheVolume("gomod")).
@@ -88,8 +97,11 @@ func test(ctx context.Context, c *dagger.Client) {
 
 // binary artefact used in container image
 func Build(ctx context.Context) {
-	c := daggerClient(ctx)
-	defer c.Close()
+	c, ok := ctx.Value("daggerClient").(*dagger.Client)
+	if !ok {
+		c := newDaggerClient(ctx)
+		defer c.Close()
+	}
 
 	build(ctx, c)
 }
@@ -98,6 +110,7 @@ func build(ctx context.Context, c *dagger.Client) *dagger.File {
 	binaryPath := fmt.Sprintf("build/%s", binaryName)
 
 	buildBinary, err := c.Container(dagger.ContainerOpts{Platform: dagger.Platform("linux/amd64")}).
+		Pipeline("build").
 		From(fmt.Sprintf("golang:%s-alpine%s", goVersion, alpineVersion)).
 		WithMountedDirectory("/src", sourceCode(c)).WithWorkdir("/src").
 		WithMountedCache("/go/pkg/mod", c.CacheVolume("gomod")).
@@ -124,8 +137,11 @@ func sourceCode(c *dagger.Client) *dagger.Directory {
 
 // container image to private registry
 func Publish(ctx context.Context) {
-	c := daggerClient(ctx)
-	defer c.Close()
+	c, ok := ctx.Value("daggerClient").(*dagger.Client)
+	if !ok {
+		c := newDaggerClient(ctx)
+		defer c.Close()
+	}
 
 	publish(ctx, c)
 }
@@ -145,8 +161,11 @@ func publish(ctx context.Context, c *dagger.Client) string {
 
 // zero-downtime deploy container image
 func Deploy(ctx context.Context) {
-	c := daggerClient(ctx)
-	defer c.Close()
+	c, ok := ctx.Value("daggerClient").(*dagger.Client)
+	if !ok {
+		c := newDaggerClient(ctx)
+		defer c.Close()
+	}
 
 	imageRef := os.Getenv("IMAGE_REF")
 	if imageRef == "" {
@@ -165,6 +184,7 @@ func deploy(ctx context.Context, c *dagger.Client, imageRef string) {
 		}
 
 		_, err = flyctl(c).
+			Pipeline("deploy").
 			WithExec([]string{
 				"deploy", "--now",
 				"--image", imageRefFlyValid.String(),
@@ -189,33 +209,17 @@ func deploy(ctx context.Context, c *dagger.Client, imageRef string) {
 
 // [lints, tests], builds, publishes & deploys a new version of the app
 func All(ctx context.Context) {
-	mg.CtxDeps(ctx, Lint, Test)
-
-	c := daggerClient(ctx)
+	c := newDaggerClient(ctx)
 	defer c.Close()
+	ctx = context.WithValue(ctx, "daggerClient", c)
+
+	mg.CtxDeps(ctx, Lint, Test)
 
 	imageRef := publish(ctx, c)
 	deploy(ctx, c, imageRef)
 }
 
-// stream app logs
-func Logs(ctx context.Context) {
-	c := daggerClient(ctx)
-	defer c.Close()
-
-	// This command does not return,
-	// therefore it will never be cached,
-	// and it can be run multiple times
-	_, err := flyctl(c).
-		WithExec([]string{"logs"}).
-		Stdout(ctx)
-
-	if err != nil {
-		panic(err)
-	}
-}
-
-func daggerClient(ctx context.Context) *dagger.Client {
+func newDaggerClient(ctx context.Context) *dagger.Client {
 	client, err := dagger.Connect(ctx, dagger.WithLogOutput(os.Stderr))
 	if err != nil {
 		panic(err)
@@ -241,6 +245,7 @@ func publishImage(ctx context.Context, c *dagger.Client, binary *dagger.File) st
 			Contents:    buildURL(),
 			Permissions: 444,
 		}).
+		WithDirectory("/src", sourceCode(c)).
 		WithEntrypoint([]string{fmt.Sprintf("/%s", binaryName)}).
 		WithRegistryAuth(appImageRegistry, "x", flyTokenSecret(c)).
 		Publish(ctx, ref)
@@ -296,7 +301,6 @@ func flyctl(c *dagger.Client) *dagger.Container {
 	flyctl := c.Container(dagger.ContainerOpts{Platform: dagger.Platform("linux/amd64")}).Pipeline("auth").
 		From(fmt.Sprintf("flyio/flyctl:v%s", flyctlVersion)).
 		WithSecretVariable("FLY_API_TOKEN", flyTokenSecret(c)).
-		WithEnvVariable("RUN_AT", time.Now().String()).
 		WithNewFile("fly.toml", dagger.ContainerWithNewFileOpts{
 			Contents: fmt.Sprintf(`
 # https://fly.io/docs/reference/configuration/
@@ -308,7 +312,9 @@ kill_signal = "SIGINT"
 kill_timeout = 30
 
 [env]
+  APP_NAME = "%s"
   PORT = "8080"
+  SYSLOG_HOST = "%s"
 
 [experimental]
   auto_rollback = true
@@ -338,7 +344,7 @@ kill_timeout = 30
     grace_period = "1s"
     interval = "5s"
     restart_limit = 0
-    timeout = "4s"`, appName, Ashburn)})
+    timeout = "4s"`, appName, Ashburn, appName, syslogHost)})
 
 	return flyctl
 }
