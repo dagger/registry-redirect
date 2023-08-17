@@ -29,9 +29,9 @@ const (
 	appImageRegistry = "registry.fly.io"
 	binaryName       = "registry-redirect"
 
-	syslogHost = "vector-2023-06-08.internal:514"
+	syslogHost = "vector-2023-08-17.internal:514"
 
-	InstancesToDeploy = "3"
+	InstancesToDeploy = "1"
 	// We want to avoid running multiple instances in the same region
 	// If there are issues with one region, the whole service will be disrupted
 	MaxInstancesPerRegion = "1"
@@ -195,7 +195,7 @@ func deploy(ctx context.Context, c *dagger.Client, imageRef string) {
 				"scale",
 				"count", InstancesToDeploy,
 				"--max-per-region", MaxInstancesPerRegion,
-				fmt.Sprintf("--region=%s,%s,%s", Ashburn, Paris, Singapore),
+				fmt.Sprintf("--region=%s", Paris),
 				"--yes",
 			}).
 			Sync(ctx)
