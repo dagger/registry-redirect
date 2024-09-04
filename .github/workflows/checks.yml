@@ -1,0 +1,59 @@
+name: Checks
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  lint-test:
+    name: Lint & Test
+    runs-on: dagger-g2-v0-12-7-2c
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        run: |
+          dagger call -m ./ci lint stdout
+
+      - name: Test
+        run: |
+          dagger call -m ./ci test stdout
+
+  publish:
+    name: Publish to ECR
+    runs-on: dagger-g2-v0-12-7-2c
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: install-aws-cli
+        uses: unfor19/install-aws-cli-action@v1
+        with:
+          version: 2
+          verbose: false
+          arch: amd64
+
+      - name: Configure AWS credentials
+        id: creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login ECR
+        id: login-ecr
+        run: |
+          export ECR_TOKEN="$(aws ecr get-login-password)"
+          echo "token=$ECR_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Publish
+        env:
+          ECR_TOKEN: ${{ steps.login-ecr.outputs.token }}
+          ECR_REGISTRY: 125635003186.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPO: registry-redirect
+        run: |
+          dagger call -m ./ci build with-registry-auth --address $ECR_REGISTRY --secret env:ECR_TOKEN --username AWS publish --address "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
