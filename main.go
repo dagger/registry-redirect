@@ -52,11 +52,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	syslogHost := os.Getenv("SYSLOG_HOST")
-	if syslogHost == "" {
-		syslogHost = "127.0.0.1:514"
-	}
-
 	appName := os.Getenv("APP_NAME")
 	if appName == "" {
 		appName = "registry-redirect"
@@ -68,10 +63,9 @@ func main() {
 		Level:     "info",
 		Component: appName,
 		Protocol:  "tcp",
-		Address:   syslogHost,
 	}
 
-	ctx, syslogger, err := logger.NewLogger(ctx, &logCfg)
+	ctx, err := logger.NewLogger(ctx, &logCfg)
 	if err != nil {
 		panic(err)
 	}
@@ -87,7 +81,6 @@ func main() {
 	if err := serve(ctx, logger); err != nil {
 		logger.Fatalf("failed to serve:+%v\n", err)
 	}
-	syslogger.Close()
 }
 
 func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
