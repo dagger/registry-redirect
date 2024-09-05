@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	golangciLintVersion = "1.54.1"
+	golangciLintVersion = "1.60.3"
 	goVersion           = "1.23"
 	alpineVersion       = "3.20"
 )
