@@ -193,7 +193,7 @@ func TestLoggerGraceFulShutDown(t *testing.T) {
 		Address:   "127.0.0.1:16901",
 	}
 
-	ctx, syslogger, err := NewLogger(context.Background(), &logCfg)
+	ctx, err := NewLogger(context.Background(), &logCfg)
 	if err != nil {
 		panic(err)
 	}
@@ -240,5 +240,4 @@ func TestLoggerGraceFulShutDown(t *testing.T) {
 	require.EqualValues(t, amountOfMessages, len(messages),
 		fmt.Sprintf("Expected %d messages, got %d", amountOfMessages, len(messages)),
 	)
-	syslogger.Close()
 }
