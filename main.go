@@ -20,6 +20,7 @@ import (
 	"github.com/chainguard-dev/registry-redirect/pkg/logger"
 	"github.com/chainguard-dev/registry-redirect/pkg/redirect"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"knative.dev/pkg/logging"
 )
@@ -64,7 +65,6 @@ func main() {
 	logCfg := logger.Config{
 		Level:     "info",
 		Component: appName,
-		Protocol:  "tcp",
 	}
 
 	ctx, err := logger.NewLogger(ctx, &logCfg)
@@ -105,6 +105,16 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 		Handler:     customHandler,
 		BaseContext: func(_ net.Listener) context.Context { return ctx },
 	}
+	go func() {
+		// start a prometheus metric server at port 9090. Don't really care
+		// for graceful termination here so we schedule it on a fire-and-forget
+		// goroutine
+		r := http.NewServeMux()
+		r.Handle("/metrics", promhttp.Handler())
+		if err = http.ListenAndServe(":9090", r); err != nil {
+			logger.Warnf("metric server exited: %s", err)
+		}
+	}()
 	go func() {
 		if err = srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("listen:%+s\n", err)
