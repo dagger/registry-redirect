@@ -110,6 +110,10 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 		// for graceful termination here so we schedule it on a fire-and-forget
 		// goroutine
 		r := http.NewServeMux()
+
+		// register custom handler metrics
+		prometheus.DefaultRegisterer.MustRegister(customHandler.requests, customHandler.latency)
+
 		r.Handle("/metrics", promhttp.Handler())
 		if err = http.ListenAndServe(":9090", r); err != nil {
 			logger.Warnf("metric server exited: %s", err)
