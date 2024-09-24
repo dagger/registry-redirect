@@ -10,7 +10,7 @@ on:
 jobs:
   lint-test:
     name: Lint & Test
-    runs-on: dagger-g2-v0-12-7-2c
+    runs-on: dagger-g2-v0-13-3-2c
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +24,7 @@ jobs:
 
   publish:
     name: Publish to ECR
-    runs-on: dagger-g2-v0-12-7-2c
+    runs-on: dagger-g2-v0-13-3-2c
     if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v4
@@ -57,3 +57,23 @@ jobs:
           ECR_REPO: dagger-registry
         run: |
           dagger call -m ./ci --source . build with-registry-auth --address $ECR_REGISTRY --secret env:ECR_TOKEN --username AWS publish --address "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
+
+      - name: "Update dagger registry deployment"
+        env:
+          DAGGER_CI_GITHUB_TOKEN: ${{ secrets.DAGGER_CI_GITHUB_TOKEN }}
+          ECR_REGISTRY: "125635003186.dkr.ecr.us-east-1.amazonaws.com"
+          ECR_REPOSITORY: dagger-registry
+          IMAGE_TAG: ${{ github.sha }}
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+        run: |
+          dagger call -m github.com/matipan/daggerverse/image-updater update \
+            --repo github.com/dagger/dagger.io \
+            --branch main \
+            --files "infra/prod/eks-2024-01-30/argocd/dagger-registry/deployment.yaml" \
+            --containers 0 \
+            --image-url "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            --git-user "dagger-ci[bot]" \
+            --git-email "founders+dagger-ci@dagger.io" \
+            --git-password env:DAGGER_CI_GITHUB_TOKEN \
+            --app-name "Dagger Registry" \
+            --force-with-lease
