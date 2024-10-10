@@ -10,7 +10,7 @@ on:
 jobs:
   lint-test:
     name: Lint & Test
-    runs-on: dagger-g2-v0-13-3-2c
+    runs-on: dagger-g2-v0-13-4-2c
     steps:
       - uses: actions/checkout@v4
 
@@ -24,8 +24,8 @@ jobs:
 
   publish:
     name: Publish to ECR
-    runs-on: dagger-g2-v0-13-3-2c
-    if: github.event_name == 'push'
+    runs-on: dagger-g2-v0-13-4-2c
+    if: github.ref_name == 'main'
     steps:
       - uses: actions/checkout@v4
 
@@ -40,8 +40,8 @@ jobs:
         id: creds
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ secrets.ECR_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ECR_AWS_SECRET_ACCESS_KEY }}
           aws-region: us-east-1
 
       - name: Login ECR
