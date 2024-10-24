@@ -16,7 +16,10 @@ type Ci struct {
 	Source *dagger.Directory
 }
 
-func New(source *dagger.Directory) *Ci {
+func New(
+	// +defaultPath="../"
+	source *dagger.Directory,
+) *Ci {
 	return &Ci{
 		Source: source,
 	}
