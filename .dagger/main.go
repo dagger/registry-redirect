@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"dagger/ci/internal/dagger"
+	"dagger/dagger-registry/internal/dagger"
 	"fmt"
 )
 
@@ -12,20 +12,20 @@ const (
 	alpineVersion       = "3.20"
 )
 
-type Ci struct {
+type DaggerRegistry struct {
 	Source *dagger.Directory
 }
 
 func New(
-	// +defaultPath="../"
+	// +defaultPath="./"
 	source *dagger.Directory,
-) *Ci {
-	return &Ci{
+) *DaggerRegistry {
+	return &DaggerRegistry{
 		Source: source,
 	}
 }
 
-func (m *Ci) Lint(ctx context.Context) *dagger.Container {
+func (m *DaggerRegistry) Lint(ctx context.Context) *dagger.Container {
 	return dag.Container().
 		From(fmt.Sprintf("golangci/golangci-lint:v%s-alpine", golangciLintVersion)).
 		WithMountedCache("/go/pkg/mod", dag.CacheVolume("registry-gomod")).
@@ -35,12 +35,12 @@ func (m *Ci) Lint(ctx context.Context) *dagger.Container {
 		WithExec([]string{"sh", "-c", "golangci-lint run --color always --timeout 2m"})
 }
 
-func (m *Ci) Test(ctx context.Context) *dagger.Container {
+func (m *DaggerRegistry) Test(ctx context.Context) *dagger.Container {
 	return m.baseContainer(ctx).
 		WithExec([]string{"sh", "-c", "go test ./..."})
 }
 
-func (m *Ci) Build(ctx context.Context) *dagger.Container {
+func (m *DaggerRegistry) Build(ctx context.Context) *dagger.Container {
 	binary := m.baseContainer(ctx).
 		WithExec([]string{"sh", "-c", "go build -o /app/registry-redirect"}).
 		File("/app/registry-redirect")
@@ -51,7 +51,7 @@ func (m *Ci) Build(ctx context.Context) *dagger.Container {
 		WithEntrypoint([]string{"/app/registry-redirect"})
 }
 
-func (m *Ci) baseContainer(ctx context.Context) *dagger.Container {
+func (m *DaggerRegistry) baseContainer(ctx context.Context) *dagger.Container {
 	return dag.Container().
 		From(fmt.Sprintf("golang:%s-alpine%s", goVersion, alpineVersion)).
 		WithMountedCache("/root/.cache/go-build", dag.CacheVolume("registry-go-build")).
