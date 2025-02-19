@@ -16,11 +16,11 @@ jobs:
 
       - name: Lint
         run: |
-          dagger call -m ./ci --source . lint stdout
+          dagger call lint stdout
 
       - name: Test
         run: |
-          dagger call -m ./ci --source . test stdout
+          dagger call test stdout
 
   publish:
     name: Publish to ECR
@@ -56,7 +56,7 @@ jobs:
           ECR_REGISTRY: 125635003186.dkr.ecr.us-east-1.amazonaws.com
           ECR_REPO: dagger-registry
         run: |
-          dagger call -m ./ci --source . build with-registry-auth --address $ECR_REGISTRY --secret env:ECR_TOKEN --username AWS publish --address "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
+          dagger call build with-registry-auth --address $ECR_REGISTRY --secret env:ECR_TOKEN --username AWS publish --address "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
 
       - name: "Update dagger registry deployment"
         env:
