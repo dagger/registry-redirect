@@ -25,6 +25,8 @@ jobs:
   publish:
     name: Publish to ECR
     runs-on: dagger-g3-v0-16-1-2c
+    needs:
+      - lint-test
     if: github.ref_name == 'main'
     steps:
       - uses: actions/checkout@v4
