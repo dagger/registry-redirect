@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 
-	"github.com/chainguard-dev/registry-redirect/pkg/syslogger"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"knative.dev/pkg/logging"
@@ -34,18 +34,11 @@ func (c *Config) customConfigToKnativeConfig() (*logging.Config, error) {
 }
 
 // NewLogger creates a new logger with the given configuration.
-func NewLogger(ctx context.Context, cfg *Config) (context.Context, *syslogger.SyslogWriter, error) {
-	syslogWriter := syslogger.NewSyslogWriter(cfg.Level, cfg.Protocol, cfg.Address, cfg.Component)
-
-	err := syslogWriter.Connect() // connect to syslog server
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to connect to syslog server: %v", err)
-	}
-
+func NewLogger(ctx context.Context, cfg *Config) (context.Context, error) {
 	// Convert custom logging config to Knative logging config
 	knativeCfg, err := cfg.customConfigToKnativeConfig()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// Create a new Zap logger and atomic level from Knative logging config
@@ -59,9 +52,8 @@ func NewLogger(ctx context.Context, cfg *Config) (context.Context, *syslogger.Sy
 		// Create a new Core that writes to our SyslogWriter, uses JSON encoding, and has the same level as our original logger.
 		syslogCore := zapcore.NewCore(
 			zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
-
-			zapcore.AddSync(syslogWriter), // write to SyslogWriter
-			atomicLevel,                   // same level as the original logger
+			zapcore.AddSync(os.Stdout),
+			atomicLevel, // same level as the original logger
 		)
 
 		// Combine the original Core and our new Core. Logs written to the resulting Core will be written to both Cores.
@@ -73,5 +65,5 @@ func NewLogger(ctx context.Context, cfg *Config) (context.Context, *syslogger.Sy
 	// Update context with our combined logger. The logger is "sugared" again because it's typically more convenient to use.
 	ctx = logging.WithLogger(ctx, baseLogger.Sugar())
 
-	return ctx, syslogWriter, nil
+	return ctx, nil
 }

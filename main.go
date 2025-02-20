@@ -13,11 +13,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/chainguard-dev/registry-redirect/pkg/logger"
 	"github.com/chainguard-dev/registry-redirect/pkg/redirect"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"knative.dev/pkg/logging"
 )
@@ -52,11 +55,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	syslogHost := os.Getenv("SYSLOG_HOST")
-	if syslogHost == "" {
-		syslogHost = "127.0.0.1:514"
-	}
-
 	appName := os.Getenv("APP_NAME")
 	if appName == "" {
 		appName = "registry-redirect"
@@ -67,11 +65,9 @@ func main() {
 	logCfg := logger.Config{
 		Level:     "info",
 		Component: appName,
-		Protocol:  "tcp",
-		Address:   syslogHost,
 	}
 
-	ctx, syslogger, err := logger.NewLogger(ctx, &logCfg)
+	ctx, err := logger.NewLogger(ctx, &logCfg)
 	if err != nil {
 		panic(err)
 	}
@@ -87,7 +83,6 @@ func main() {
 	if err := serve(ctx, logger); err != nil {
 		logger.Fatalf("failed to serve:+%v\n", err)
 	}
-	syslogger.Close()
 }
 
 func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
@@ -110,6 +105,20 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 		Handler:     customHandler,
 		BaseContext: func(_ net.Listener) context.Context { return ctx },
 	}
+	go func() {
+		// start a prometheus metric server at port 9090. Don't really care
+		// for graceful termination here so we schedule it on a fire-and-forget
+		// goroutine
+		r := http.NewServeMux()
+
+		// register custom handler metrics
+		prometheus.DefaultRegisterer.MustRegister(customHandler.requests, customHandler.latency)
+
+		r.Handle("/metrics", promhttp.Handler())
+		if err = http.ListenAndServe(":9090", r); err != nil {
+			logger.Warnf("metric server exited: %s", err)
+		}
+	}()
 	go func() {
 		if err = srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("listen:%+s\n", err)
@@ -142,14 +151,56 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 type CustomHandler struct {
 	wg      *sync.WaitGroup
 	handler http.Handler
+
+	requests *prometheus.CounterVec
+	latency  *prometheus.HistogramVec
 }
 
 func NewCustomHandler(wg *sync.WaitGroup, handler http.Handler) *CustomHandler {
-	return &CustomHandler{wg: wg, handler: handler}
+	ch := &CustomHandler{wg: wg, handler: handler}
+	ch.requests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:        "requests_total",
+			Help:        "Number of HTTP requests partitioned by method and HTTP path.",
+			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
+		}, []string{"method", "path"})
+
+	ch.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:        "request_duration_ms",
+		Help:        "Time spent on the request partitioned by method and HTTP path.",
+		ConstLabels: prometheus.Labels{"service": "registry-redirect"},
+		Buckets:     []float64{50, 150, 300, 500, 1200, 5000, 10000},
+	}, []string{"method", "path"})
+	return ch
 }
 
+var (
+	serverPaths = []string{
+		"/v2/dagger/engine/blobs",
+		"/v2/engine/blobs",
+		"/v2/engine/manifests",
+		"/token",
+	}
+)
+
 func (h *CustomHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	h.wg.Add(1)
 	defer h.wg.Done()
+
+	path := "unknown"
+	for _, p := range serverPaths {
+		if strings.Contains(r.URL.Path, p) {
+			path = p
+			break
+		}
+	}
+
+	defer func() {
+		h.requests.WithLabelValues(r.Method, path).Inc()
+		h.latency.WithLabelValues(r.Method, path).Observe(float64(time.Since(start).Milliseconds()))
+	}()
+
 	h.handler.ServeHTTP(w, r) // Call your original handler
 }

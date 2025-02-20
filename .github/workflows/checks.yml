@@ -1,0 +1,79 @@
+name: Checks
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  lint-test:
+    name: Lint & Test
+    runs-on: dagger-g3-v0-16-1-2c
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        run: |
+          dagger call lint stdout
+
+      - name: Test
+        run: |
+          dagger call test stdout
+
+  publish:
+    name: Publish to ECR
+    runs-on: dagger-g3-v0-16-1-2c
+    if: github.ref_name == 'main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: install-aws-cli
+        uses: unfor19/install-aws-cli-action@v1
+        with:
+          version: 2
+          verbose: false
+          arch: amd64
+
+      - name: Configure AWS credentials
+        id: creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ECR_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ECR_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login ECR
+        id: login-ecr
+        run: |
+          export ECR_TOKEN="$(aws ecr get-login-password)"
+          echo "token=$ECR_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Publish
+        env:
+          ECR_TOKEN: ${{ steps.login-ecr.outputs.token }}
+          ECR_REGISTRY: 125635003186.dkr.ecr.us-east-1.amazonaws.com
+          ECR_REPO: dagger-registry
+        run: |
+          dagger call build with-registry-auth --address $ECR_REGISTRY --secret env:ECR_TOKEN --username AWS publish --address "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
+
+      - name: "Update dagger registry deployment"
+        env:
+          DAGGER_CI_GITHUB_TOKEN: ${{ secrets.DAGGER_CI_GITHUB_TOKEN }}
+          ECR_REGISTRY: "125635003186.dkr.ecr.us-east-1.amazonaws.com"
+          ECR_REPOSITORY: dagger-registry
+          IMAGE_TAG: ${{ github.sha }}
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+        run: |
+          dagger call -m github.com/matipan/daggerverse/image-updater update \
+            --repo github.com/dagger/dagger.io \
+            --branch main \
+            --files "infra/prod/eks-2024-01-30/argocd/dagger-registry/deployment.yaml" \
+            --containers 0 \
+            --image-url "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            --git-user "dagger-ci[bot]" \
+            --git-email "founders+dagger-ci@dagger.io" \
+            --git-password env:DAGGER_CI_GITHUB_TOKEN \
+            --app-name "Dagger Registry" \
+            --force-with-lease
