@@ -27,7 +27,7 @@ jobs:
     runs-on: dagger-g3-v0-16-1-2c
     needs:
       - lint-test
-    if: github.ref_name == 'main'
+      # if: github.ref_name == 'main'
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +69,7 @@ jobs:
           DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
         run: |
           dagger call -m github.com/matipan/daggerverse/image-updater update \
-            --repo github.com/dagger/dagger.io \
+            --repo https://github.com/dagger/dagger.io \
             --branch main \
             --files "infra/prod/eks-2024-01-30/argocd/dagger-registry/deployment.yaml" \
             --containers 0 \
