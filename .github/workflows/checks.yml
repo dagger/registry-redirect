@@ -10,7 +10,7 @@ on:
 jobs:
   lint-test:
     name: Lint & Test
-    runs-on: dagger-g3-v0-15-4-2c
+    runs-on: dagger-g3-v0-16-1-2c
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +24,7 @@ jobs:
 
   publish:
     name: Publish to ECR
-    runs-on: dagger-g3-v0-15-4-2c
+    runs-on: dagger-g3-v0-16-1-2c
     if: github.ref_name == 'main'
     steps:
       - uses: actions/checkout@v4
