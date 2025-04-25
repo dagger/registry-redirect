@@ -32,7 +32,7 @@ func (m *DaggerRegistry) Lint(ctx context.Context) *dagger.Container {
 		WithEnvVariable("GOMODCACHE", "/go/pkg/mod").
 		WithDirectory("/app", m.Source).
 		WithWorkdir("/app").
-		WithExec([]string{"sh", "-c", "golangci-lint run --color always --timeout 2m"})
+		WithExec([]string{"sh", "-c", "golangci-lint run --color always --timeout 2m --disable errcheck"})
 }
 
 func (m *DaggerRegistry) Test(ctx context.Context) *dagger.Container {

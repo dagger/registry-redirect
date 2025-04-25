@@ -339,7 +339,7 @@ func (rdr redirect) getToken(r *http.Request) (string, *http.Response, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", resp, fmt.Errorf("Error getting token: %v", resp.Status)
+		return "", resp, fmt.Errorf("error getting token: %v", resp.Status)
 	}
 	var t struct {
 		Token string `json:"token"`
