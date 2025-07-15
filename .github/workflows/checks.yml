@@ -75,6 +75,7 @@ jobs:
           ECR_TOKEN: ${{ steps.login-ecr.outputs.token }}
           ECR_REGISTRY: 125635003186.dkr.ecr.us-east-1.amazonaws.com
           ECR_REPO: dagger-registry
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
         run: |
           dagger --cloud call build with-registry-auth --address $ECR_REGISTRY --secret env:ECR_TOKEN --username AWS publish --address "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
 
