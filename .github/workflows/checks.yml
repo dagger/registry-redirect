@@ -10,21 +10,25 @@ on:
 jobs:
   lint-test:
     name: Lint & Test
-    runs-on: dagger-g3-v0-18-4-2c
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
       - name: Lint
+        env:
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
         run: |
-          dagger call lint stdout
+          dagger --cloud call lint stdout
 
       - name: Test
+        env:
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
         run: |
-          dagger call test stdout
+          dagger --cloud call test stdout
 
   publish:
     name: Publish to ECR
-    runs-on: dagger-g3-v0-18-4-2c
+    runs-on: ubuntu-24.04
     needs:
       - lint-test
     if: github.ref_name == 'main'
@@ -58,7 +62,7 @@ jobs:
           ECR_REGISTRY: 125635003186.dkr.ecr.us-east-1.amazonaws.com
           ECR_REPO: dagger-registry
         run: |
-          dagger call build with-registry-auth --address $ECR_REGISTRY --secret env:ECR_TOKEN --username AWS publish --address "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
+          dagger --cloud call build with-registry-auth --address $ECR_REGISTRY --secret env:ECR_TOKEN --username AWS publish --address "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
 
       - name: "Update dagger registry deployment"
         env:
@@ -68,7 +72,7 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
           DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
         run: |
-          dagger call -m github.com/matipan/daggerverse/image-updater update \
+          dagger --cloud call -m github.com/matipan/daggerverse/image-updater update \
             --repo https://github.com/dagger/dagger.io \
             --branch main \
             --files "infra/prod/eks-2024-01-30/argocd/dagger-registry/deployment.yaml" \
