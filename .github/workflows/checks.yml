@@ -14,6 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install dagger
+        shell: bash
+        run: |
+          echo "::group::Installing dagger"
+          curl -fsSL https://dl.dagger.io/dagger/install.sh | BIN_DIR=/usr/local/bin/ sudo -E sh
+          echo "::endgroup::"
+
       - name: Lint
         env:
           DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
@@ -34,6 +41,13 @@ jobs:
     if: github.ref_name == 'main'
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install dagger
+        shell: bash
+        run: |
+          echo "::group::Installing dagger"
+          curl -fsSL https://dl.dagger.io/dagger/install.sh | BIN_DIR=/usr/local/bin/ sudo -E sh
+          echo "::endgroup::"
 
       - id: install-aws-cli
         uses: unfor19/install-aws-cli-action@v1
