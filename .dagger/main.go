@@ -8,8 +8,8 @@ import (
 
 const (
 	golangciLintVersion = "2.1-alpine@sha256:eff222d3ac17f7e2a12dbe757cb33c2dc7899cd5bfae4432594e558a1e1e0228"
-	goVersion           = "1.24.4-alpine3.22@sha256:ddf52008bce1be455fe2b22d780b6693259aaf97b16383b6372f4b22dd33ad66"
-	alpineVersion       = "3.22@sha256:8a1f59ffb675680d47db6337b49d22281a139e9d709335b492be023728e11715"
+	goVersion           = "1.25.5-alpine3.23@sha256:ac09a5f469f307e5da71e766b0bd59c9c49ea460a528cc3e6686513d64a6f1fb"
+	alpineVersion       = "3.23@sha256:865b95f46d98cf867a156fe4a135ad3fe50d2056aa3f25ed31662dff6da4eb62"
 )
 
 type DaggerRegistry struct {

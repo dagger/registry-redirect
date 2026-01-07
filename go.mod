@@ -1,6 +1,6 @@
 module github.com/chainguard-dev/registry-redirect
 
-go 1.24.4
+go 1.25.5
 
 require (
 	github.com/google/go-containerregistry v0.11.0
