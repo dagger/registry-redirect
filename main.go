@@ -9,18 +9,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
-	"sync"
 	"time"
 
-	"github.com/chainguard-dev/registry-redirect/pkg/logger"
 	"github.com/chainguard-dev/registry-redirect/pkg/redirect"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"knative.dev/pkg/logging"
 )
@@ -55,23 +49,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	appName := os.Getenv("APP_NAME")
-	if appName == "" {
-		appName = "registry-redirect"
-	}
-
-	// Minimum severity of the messages that the logger will log:
-	// info, warning, error and fatal
-	logCfg := logger.Config{
-		Level:     "info",
-		Component: appName,
-	}
-
-	ctx, err := logger.NewLogger(ctx, &logCfg)
-	if err != nil {
-		panic(err)
-	}
-
 	logger := logging.FromContext(ctx)
 
 	go func() {
@@ -91,9 +68,8 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 	if *gcr {
 		host = "gcr.io"
 	}
-	wg := &sync.WaitGroup{}
 	r := redirect.New(host, *repo, *prefix)
-	customHandler := NewCustomHandler(wg, r)
+	http.Handle("/", r)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -101,24 +77,9 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 	}
 	logger.Info("http server starting...")
 	srv := &http.Server{
-		Addr:        fmt.Sprintf(":%s", port),
-		Handler:     customHandler,
-		BaseContext: func(_ net.Listener) context.Context { return ctx },
+		Addr:    fmt.Sprintf(":%s", port),
+		Handler: nil,
 	}
-	go func() {
-		// start a prometheus metric server at port 9090. Don't really care
-		// for graceful termination here so we schedule it on a fire-and-forget
-		// goroutine
-		r := http.NewServeMux()
-
-		// register custom handler metrics
-		prometheus.DefaultRegisterer.MustRegister(customHandler.requests, customHandler.latency)
-
-		r.Handle("/metrics", promhttp.Handler())
-		if err = http.ListenAndServe(":9090", r); err != nil {
-			logger.Warnf("metric server exited: %s", err)
-		}
-	}()
 	go func() {
 		if err = srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatalf("listen:%+s\n", err)
@@ -137,70 +98,11 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 		logger.Fatalf("http server shutdown failed:%+s", err)
 	}
 
-	// Wait for in-flight requests to complete before shutting down
-	wg.Wait()
-
 	logger.Infof("http server shutdown gracefully")
 
 	if err == http.ErrServerClosed {
 		err = nil
 	}
+
 	return
-}
-
-type CustomHandler struct {
-	wg      *sync.WaitGroup
-	handler http.Handler
-
-	requests *prometheus.CounterVec
-	latency  *prometheus.HistogramVec
-}
-
-func NewCustomHandler(wg *sync.WaitGroup, handler http.Handler) *CustomHandler {
-	ch := &CustomHandler{wg: wg, handler: handler}
-	ch.requests = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name:        "requests_total",
-			Help:        "Number of HTTP requests partitioned by method and HTTP path.",
-			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
-		}, []string{"method", "path"})
-
-	ch.latency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:        "request_duration_ms",
-		Help:        "Time spent on the request partitioned by method and HTTP path.",
-		ConstLabels: prometheus.Labels{"service": "registry-redirect"},
-		Buckets:     []float64{50, 150, 300, 500, 1200, 5000, 10000},
-	}, []string{"method", "path"})
-	return ch
-}
-
-var (
-	serverPaths = []string{
-		"/v2/dagger/engine/blobs",
-		"/v2/engine/blobs",
-		"/v2/engine/manifests",
-		"/token",
-	}
-)
-
-func (h *CustomHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-
-	h.wg.Add(1)
-	defer h.wg.Done()
-
-	path := "unknown"
-	for _, p := range serverPaths {
-		if strings.Contains(r.URL.Path, p) {
-			path = p
-			break
-		}
-	}
-
-	defer func() {
-		h.requests.WithLabelValues(r.Method, path).Inc()
-		h.latency.WithLabelValues(r.Method, path).Observe(float64(time.Since(start).Milliseconds()))
-	}()
-
-	h.handler.ServeHTTP(w, r) // Call your original handler
 }
