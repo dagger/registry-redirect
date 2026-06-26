@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -30,10 +31,23 @@ func redact(in http.Header) http.Header {
 }
 
 func New(host, repo, prefix string) http.Handler {
+	return NewWithOptions(host, repo, prefix, DefaultOptions())
+}
+
+func NewWithOptions(host, repo, prefix string, opts Options) http.Handler {
+	opts = opts.withDefaults()
 	rdr := redirect{
-		host:   host,
-		repo:   repo,
-		prefix: prefix,
+		host:      host,
+		repo:      repo,
+		prefix:    prefix,
+		client:    opts.Client,
+		transport: opts.Transport,
+	}
+	if !opts.RateLimit.Disabled {
+		rdr.rateLimiter = newIPRateLimiter(opts.RateLimit)
+	}
+	if !opts.ManifestCache.Disabled {
+		rdr.manifestCache = newManifestCache(opts.ManifestCache.MaxBytes)
 	}
 	router := mux.NewRouter()
 
@@ -57,13 +71,21 @@ func New(host, repo, prefix string) http.Handler {
 			"header", redact(req.Header))
 		resp.WriteHeader(http.StatusNotFound)
 	})
-	return router
+
+	if rdr.rateLimiter == nil {
+		return router
+	}
+	return rdr.rateLimiter.wrap(router)
 }
 
 type redirect struct {
-	host   string
-	repo   string
-	prefix string
+	host          string
+	repo          string
+	prefix        string
+	client        *http.Client
+	transport     http.RoundTripper
+	rateLimiter   *ipRateLimiter
+	manifestCache *manifestCache
 }
 
 func (rdr redirect) v2(resp http.ResponseWriter, req *http.Request) {
@@ -84,7 +106,7 @@ func (rdr redirect) v2(resp http.ResponseWriter, req *http.Request) {
 		"header", redact(req.Header))
 	resp.Header().Set("X-Redirected", req.URL.String())
 
-	back, err := http.DefaultClient.Do(out)
+	back, err := rdr.client.Do(out)
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
 		http.Error(resp, err.Error(), http.StatusInternalServerError)
@@ -151,7 +173,7 @@ func (rdr redirect) token(w http.ResponseWriter, r *http.Request) {
 		"header", redact(req.Header))
 	w.Header().Set("X-Redirected", req.URL.String())
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := rdr.client.Do(req)
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -207,6 +229,14 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 	if query := r.URL.Query().Encode(); query != "" {
 		url += "?" + query
 	}
+	cacheKey, isManifestCacheable := rdr.manifestCacheKey(r, url)
+	if isManifestCacheable {
+		if entry, ok := rdr.manifestCache.get(cacheKey); ok {
+			rdr.serveCachedManifest(w, r, url, entry)
+			return
+		}
+	}
+
 	req, _ := http.NewRequest(r.Method, url, nil)
 	req.Header = r.Header.Clone()
 
@@ -236,7 +266,7 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 		"header", redact(req.Header))
 	w.Header().Set("X-Redirected", req.URL.String())
 
-	resp, err := http.DefaultTransport.RoundTrip(req) // Transport doesn't follow redirects.
+	resp, err := rdr.transport.RoundTrip(req) // Transport doesn't follow redirects.
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -298,9 +328,14 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		return
-	} else {
-		w.WriteHeader(resp.StatusCode)
 	}
+
+	if isManifestCacheable && r.Method == http.MethodGet && resp.StatusCode == http.StatusOK {
+		rdr.proxyAndCacheManifest(w, resp, cacheKey)
+		return
+	}
+
+	w.WriteHeader(resp.StatusCode)
 
 	// Unless we're serving blobs, also proxy the response body, if any.
 	// Most of the time blob responses will just be 302 redirects to
@@ -314,6 +349,116 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 			logger.Errorf("Error copying response body: %v", err)
 		}
 	}
+}
+
+func (rdr redirect) manifestCacheKey(r *http.Request, upstreamURL string) (string, bool) {
+	if rdr.manifestCache == nil {
+		return "", false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return "", false
+	}
+	if !strings.Contains(r.URL.Path, "/manifests/") {
+		return "", false
+	}
+	return upstreamURL + "\naccept:" + r.Header.Get("Accept"), true
+}
+
+func (rdr redirect) serveCachedManifest(w http.ResponseWriter, r *http.Request, upstreamURL string, entry *manifestCacheEntry) {
+	copyHeaders(w.Header(), entry.header)
+	w.Header().Set("X-Redirected", upstreamURL)
+
+	if ifNoneMatchMatches(r.Header.Get("If-None-Match"), entry.header) {
+		w.Header().Del("Content-Length")
+		rdr.logCachedManifest(w, r, upstreamURL, http.StatusNotModified)
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	if w.Header().Get("Content-Length") == "" {
+		w.Header().Set("Content-Length", strconv.Itoa(len(entry.body)))
+	}
+	rdr.logCachedManifest(w, r, upstreamURL, entry.status)
+	w.WriteHeader(entry.status)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write(entry.body)
+}
+
+func (rdr redirect) logCachedManifest(w http.ResponseWriter, r *http.Request, upstreamURL string, status int) {
+	logger := logging.FromContext(r.Context())
+	logger.Infow("serving cached manifest",
+		"method", r.Method,
+		"url", r.URL.String(),
+		"request_header", redact(r.Header),
+		"upstream_url", upstreamURL,
+		"status", fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		"response_header", redact(w.Header()))
+}
+
+func (rdr redirect) proxyAndCacheManifest(w http.ResponseWriter, resp *http.Response, cacheKey string) {
+	body, tooLarge, err := readBodyWithLimit(resp.Body, rdr.manifestCache.maxBodyBytes())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if !tooLarge {
+		rdr.manifestCache.set(cacheKey, resp.StatusCode, resp.Header, body)
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	if _, err := w.Write(body); err != nil {
+		return
+	}
+	if tooLarge {
+		_, _ = io.Copy(w, resp.Body)
+	}
+}
+
+func readBodyWithLimit(body io.Reader, maxBytes int64) ([]byte, bool, error) {
+	limited := io.LimitReader(body, maxBytes+1)
+	out, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(out)) > maxBytes {
+		return out, true, nil
+	}
+	return out, false, nil
+}
+
+func copyHeaders(dst, src http.Header) {
+	for key, values := range src {
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func ifNoneMatchMatches(value string, header http.Header) bool {
+	if value == "" {
+		return false
+	}
+
+	matches := map[string]bool{}
+	if etag := header.Get("Etag"); etag != "" {
+		matches[etag] = true
+		matches[strings.TrimPrefix(etag, "W/")] = true
+	}
+	if digest := header.Get("Docker-Content-Digest"); digest != "" {
+		matches[digest] = true
+		matches[`"`+digest+`"`] = true
+	}
+
+	for _, candidate := range strings.Split(value, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || matches[candidate] || matches[strings.TrimPrefix(candidate, "W/")] {
+			return true
+		}
+	}
+	return false
 }
 
 func (rdr redirect) getToken(r *http.Request) (string, *http.Response, error) {
@@ -333,7 +478,7 @@ func (rdr redirect) getToken(r *http.Request) (string, *http.Response, error) {
 	}
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req.Header = r.Header.Clone()
-	resp, err := http.DefaultClient.Do(req) //nolint:gosec
+	resp, err := rdr.client.Do(req) //nolint:gosec
 	if err != nil {
 		return "", nil, err
 	}
