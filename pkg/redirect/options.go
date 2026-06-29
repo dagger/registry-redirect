@@ -11,6 +11,7 @@ const (
 	defaultRateLimitIdleTTL           = 10 * time.Minute
 	defaultRateLimitMaxIPs            = 10000
 	defaultManifestCacheMaxBytes      = 256 * 1024 * 1024
+	defaultBackendRequestTimeout      = 5 * time.Second
 )
 
 type Options struct {
@@ -34,9 +35,13 @@ type ManifestCacheOptions struct {
 }
 
 func DefaultOptions() Options {
+	transport := http.DefaultTransport
 	return Options{
-		Transport: http.DefaultTransport,
-		Client:    http.DefaultClient,
+		Transport: transport,
+		Client: &http.Client{
+			Transport: transport,
+			Timeout:   defaultBackendRequestTimeout,
+		},
 		RateLimit: RateLimitOptions{
 			RequestsPerMinute: defaultRateLimitRequestsPerMinute,
 			Burst:             defaultRateLimitBurst,
@@ -56,6 +61,10 @@ func (o Options) withDefaults() Options {
 	}
 	if o.Client == nil {
 		o.Client = defaults.Client
+	} else if o.Client.Timeout == 0 {
+		client := *o.Client
+		client.Timeout = defaultBackendRequestTimeout
+		o.Client = &client
 	}
 	if o.RateLimit.RequestsPerMinute <= 0 {
 		o.RateLimit.RequestsPerMinute = defaults.RateLimit.RequestsPerMinute
