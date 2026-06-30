@@ -1,0 +1,46 @@
+app = "dagger-registry-2023-01-23"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+primary_region = "iad"
+
+[deploy]
+strategy = "bluegreen"
+
+[env]
+PORT = "8080"
+
+[metrics]
+port = 9090
+path = "/metrics"
+processes = [ "app" ]
+
+[experimental]
+auto_rollback = true
+cmd = [ "-repo", "dagger" ]
+
+  [experimental.attached]
+  secrets = { }
+
+[[services]]
+internal_port = 8_080
+processes = [ "app" ]
+protocol = "tcp"
+
+  [services.concurrency]
+  hard_limit = 1_000
+  soft_limit = 800
+  type = "connections"
+
+  [[services.ports]]
+  force_https = true
+  handlers = [ "http" ]
+  port = 80
+
+  [[services.ports]]
+  handlers = [ "tls", "http" ]
+  port = 443
+
+  [[services.tcp_checks]]
+  grace_period = "1s"
+  interval = "5s"
+  timeout = "4s"

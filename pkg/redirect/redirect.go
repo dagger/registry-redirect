@@ -6,7 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 package redirect
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -37,11 +39,11 @@ func New(host, repo, prefix string) http.Handler {
 func NewWithOptions(host, repo, prefix string, opts Options) http.Handler {
 	opts = opts.withDefaults()
 	rdr := redirect{
-		host:      host,
-		repo:      repo,
-		prefix:    prefix,
-		client:    opts.Client,
-		transport: opts.Transport,
+		host:        host,
+		repo:        repo,
+		prefix:      prefix,
+		client:      opts.Client,
+		proxyClient: noRedirectClient(opts.Client, opts.Transport),
 	}
 	if !opts.RateLimit.Disabled {
 		rdr.rateLimiter = newIPRateLimiter(opts.RateLimit)
@@ -83,9 +85,40 @@ type redirect struct {
 	repo          string
 	prefix        string
 	client        *http.Client
-	transport     http.RoundTripper
+	proxyClient   *http.Client
 	rateLimiter   *ipRateLimiter
 	manifestCache *manifestCache
+}
+
+func noRedirectClient(client *http.Client, transport http.RoundTripper) *http.Client {
+	out := *client
+	out.Transport = transport
+	out.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &out
+}
+
+func newBackendRequest(ctx context.Context, method, url string, header http.Header) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if header != nil {
+		req.Header = header.Clone()
+	}
+	return req, nil
+}
+
+func backendErrorStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusInternalServerError
 }
 
 func (rdr redirect) v2(resp http.ResponseWriter, req *http.Request) {
@@ -98,7 +131,12 @@ func (rdr redirect) v2(resp http.ResponseWriter, req *http.Request) {
 	} else {
 		url = "https://ghcr.io/v2/"
 	}
-	out, _ := http.NewRequest(req.Method, url, nil)
+	out, err := newBackendRequest(ctx, req.Method, url, nil)
+	if err != nil {
+		logger.Errorf("Error creating request: %v", err)
+		http.Error(resp, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	logger.Infow("sending request",
 		"method", req.Method,
@@ -109,7 +147,7 @@ func (rdr redirect) v2(resp http.ResponseWriter, req *http.Request) {
 	back, err := rdr.client.Do(out)
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
-		http.Error(resp, err.Error(), http.StatusInternalServerError)
+		http.Error(resp, err.Error(), backendErrorStatus(err))
 		return
 	}
 	defer back.Body.Close()
@@ -164,8 +202,12 @@ func (rdr redirect) token(w http.ResponseWriter, r *http.Request) {
 		url = "https://ghcr.io/token?" + vals.Encode()
 	}
 
-	req, _ := http.NewRequest(r.Method, url, nil)
-	req.Header = r.Header.Clone()
+	req, err := newBackendRequest(ctx, r.Method, url, r.Header)
+	if err != nil {
+		logger.Errorf("Error creating request: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	logger.Infow("sending request",
 		"method", req.Method,
@@ -176,7 +218,7 @@ func (rdr redirect) token(w http.ResponseWriter, r *http.Request) {
 	resp, err := rdr.client.Do(req)
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), backendErrorStatus(err))
 		return
 	}
 	defer resp.Body.Close()
@@ -237,8 +279,12 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	req, _ := http.NewRequest(r.Method, url, nil)
-	req.Header = r.Header.Clone()
+	req, err := newBackendRequest(ctx, r.Method, url, r.Header)
+	if err != nil {
+		logger.Errorf("Error creating request: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// If the request is coming in without auth, get some auth.
 	// This is useful for testing, but should never happen in real life.
@@ -266,10 +312,10 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 		"header", redact(req.Header))
 	w.Header().Set("X-Redirected", req.URL.String())
 
-	resp, err := rdr.transport.RoundTrip(req) // Transport doesn't follow redirects.
+	resp, err := rdr.proxyClient.Do(req)
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, err.Error(), backendErrorStatus(err))
 		return
 	}
 	defer resp.Body.Close()
@@ -476,8 +522,11 @@ func (rdr redirect) getToken(r *http.Request) (string, *http.Response, error) {
 	} else {
 		url = fmt.Sprintf("https://ghcr.io/token?scope=repository:%s:pull&service=ghcr.io", strings.Join(parts, "/"))
 	}
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	req.Header = r.Header.Clone()
+	req, err := newBackendRequest(r.Context(), http.MethodGet, url, r.Header)
+	if err != nil {
+		return "", nil, err
+	}
+
 	resp, err := rdr.client.Do(req) //nolint:gosec
 	if err != nil {
 		return "", nil, err
