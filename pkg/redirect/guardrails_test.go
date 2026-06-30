@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -278,6 +279,103 @@ func TestIPRateLimiterRejectsNoisyClients(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "TOOMANYREQUESTS") {
 		t.Fatalf("rate-limit body = %q", rec.Body.String())
+	}
+}
+
+func TestIPRateLimiterRecordsRateLimitedClients(t *testing.T) {
+	tracker := redirect.NewRateLimitedIPTracker(50)
+	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
+		RateLimit: redirect.RateLimitOptions{
+			RequestsPerMinute: 1,
+			Burst:             1,
+			IdleTTL:           time.Minute,
+			MaxIPs:            10,
+			LimitedIPs:        tracker,
+		},
+		ManifestCache: redirect.ManifestCacheOptions{
+			Disabled: true,
+		},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "203.0.113.10:1234"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("first status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
+	}
+	if got := tracker.TopMap(); len(got) != 0 {
+		t.Fatalf("tracker after allowed request = %#v, want empty", got)
+	}
+
+	for i := 0; i < 2; i++ {
+		req = httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.10:1234"
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("limited request %d status = %d, want %d", i, rec.Code, http.StatusTooManyRequests)
+		}
+	}
+
+	got := tracker.TopMap()
+	if got["203.0.113.10"] != 2 {
+		t.Fatalf("tracked count = %#v, want 203.0.113.10 counted twice", got)
+	}
+}
+
+func TestIPRateLimiterUsesOverrideForConfiguredIPRanges(t *testing.T) {
+	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
+		RateLimit: redirect.RateLimitOptions{
+			RequestsPerMinute: 1,
+			Burst:             1,
+			IdleTTL:           time.Minute,
+			MaxIPs:            10,
+			IPOverrides: []redirect.IPRateLimitOverride{{
+				RequestsPerMinute: 2,
+				Burst:             2,
+				IPPrefixes: []netip.Prefix{
+					netip.MustParsePrefix("203.0.113.0/24"),
+				},
+			}},
+		},
+		ManifestCache: redirect.ManifestCacheOptions{
+			Disabled: true,
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.10:1234"
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("configured request %d status = %d, want %d", i, rec.Code, http.StatusTemporaryRedirect)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "203.0.113.10:1234"
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("configured limited status = %d, want %d", rec.Code, http.StatusTooManyRequests)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "198.51.100.10:1234"
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("default first status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "198.51.100.10:1234"
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("default limited status = %d, want %d", rec.Code, http.StatusTooManyRequests)
 	}
 }
 

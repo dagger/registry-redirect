@@ -12,9 +12,11 @@ const (
 	alpineVersion       = "3.23@sha256:865b95f46d98cf867a156fe4a135ad3fe50d2056aa3f25ed31662dff6da4eb62"
 	flyctlVersion       = "0.1.78"
 
-	appName          = "dagger-registry-2023-01-23"
-	appImageRegistry = "registry.fly.io"
-	binaryName       = "registry-redirect"
+	appName           = "dagger-registry-2023-01-23"
+	appImageRegistry  = "registry.fly.io"
+	binaryName        = "registry-redirect"
+	ipRateLimitConfig = "github-actions-rate-limit.json"
+	githubMetaURL     = "https://api.github.com/meta"
 )
 
 type DaggerRegistry struct {
@@ -57,7 +59,34 @@ func (m *DaggerRegistry) Build(ctx context.Context) *dagger.Container {
 	return dag.Container().
 		From("alpine:"+alpineVersion).
 		WithFile(fmt.Sprintf("/app/%s", binaryName), binary).
+		WithFile(fmt.Sprintf("/app/%s", ipRateLimitConfig), m.Source.File(ipRateLimitConfig)).
+		WithWorkdir("/app").
 		WithEntrypoint([]string{fmt.Sprintf("/app/%s", binaryName)})
+}
+
+func (m *DaggerRegistry) UpdateGitHubActionsRateLimitConfig() *dagger.Directory {
+	script := fmt.Sprintf(`set -eu
+curl -fsSL \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'X-GitHub-Api-Version: 2026-03-10' \
+  -o /tmp/github-meta.json \
+  %q
+jq -e '{
+  rate_limit: {
+    requests_per_minute: 480,
+    burst: 960
+  },
+  ip_ranges: (.actions | if type == "array" then . else error("missing actions array") end)
+}' /tmp/github-meta.json > %q
+`, githubMetaURL, ipRateLimitConfig)
+
+	return dag.Container().
+		From("alpine:"+alpineVersion).
+		WithExec([]string{"apk", "add", "--no-cache", "curl", "jq"}).
+		WithDirectory("/src", m.Source).
+		WithWorkdir("/src").
+		WithExec([]string{"sh", "-c", script}).
+		Directory("/src")
 }
 
 func (m *DaggerRegistry) Publish(
