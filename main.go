@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -23,6 +25,9 @@ import (
 	"go.uber.org/zap"
 	"knative.dev/pkg/logging"
 )
+
+const defaultIPRateLimitConfigPath = "github-actions-rate-limit.json"
+const defaultRateLimitedIPTrackerLimit = 50
 
 // TODO:
 // - Also support anonymous and Basic-type auth?
@@ -46,6 +51,8 @@ var (
 	// - example.dev/foo/bar -> ghcr.io/distroless/foo/bar
 	// (this is for backward compatibility with prefix-less redirects)
 	prefix = flag.String("prefix", "", "if set, user-visible repo prefix")
+
+	ipRateLimitConfig = flag.String("ip-rate-limit-config", defaultIPRateLimitConfigPath, "JSON file with IP-specific rate limit overrides; set empty to disable")
 )
 
 func main() {
@@ -67,14 +74,21 @@ func main() {
 	}
 }
 
-func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
+func serve(ctx context.Context, logger *zap.SugaredLogger) error {
 	flag.Parse()
 	host := "ghcr.io"
 	if *gcr {
 		host = "gcr.io"
 	}
+	opts, err := redirectOptions(logger)
+	if err != nil {
+		return err
+	}
+	rateLimitedIPs := redirect.NewRateLimitedIPTracker(defaultRateLimitedIPTrackerLimit)
+	opts.RateLimit.LimitedIPs = rateLimitedIPs
+
 	wg := &sync.WaitGroup{}
-	r := redirect.New(host, *repo, *prefix)
+	r := redirect.NewWithOptions(host, *repo, *prefix, opts)
 	customHandler := NewCustomHandler(wg, r)
 
 	port := os.Getenv("PORT")
@@ -96,13 +110,14 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 		prometheus.DefaultRegisterer.MustRegister(customHandler.requests, customHandler.responses, customHandler.latency)
 
 		r.Handle("/metrics", promhttp.Handler())
-		if err = http.ListenAndServe(":9090", r); err != nil {
-			logger.Warnf("metric server exited: %s", err)
+		r.Handle("/rate-limited-ips", rateLimitedIPsHandler(rateLimitedIPs))
+		if listenErr := http.ListenAndServe(":9090", r); listenErr != nil {
+			logger.Warnf("metric server exited: %s", listenErr)
 		}
 	}()
 	go func() {
-		if err = srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatalf("listen:%+s\n", err)
+		if listenErr := srv.ListenAndServe(); listenErr != nil && listenErr != http.ErrServerClosed {
+			logger.Fatalf("listen:%+s\n", listenErr)
 		}
 	}()
 	logger.Infof("http server listening on port: %s", port)
@@ -114,7 +129,7 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 		cancel()
 	}()
 
-	if err = srv.Shutdown(ctxShutDown); err != nil {
+	if err := srv.Shutdown(ctxShutDown); err != nil {
 		logger.Fatalf("http server shutdown failed:%+s", err)
 	}
 
@@ -123,11 +138,7 @@ func serve(ctx context.Context, logger *zap.SugaredLogger) (err error) {
 
 	logger.Infof("http server shutdown gracefully")
 
-	if err == http.ErrServerClosed {
-		err = nil
-	}
-
-	return
+	return nil
 }
 
 type CustomHandler struct {
@@ -245,4 +256,61 @@ func (h *CustomHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	h.handler.ServeHTTP(rw, r) // Call your original handler
+}
+
+func redirectOptions(logger *zap.SugaredLogger) (redirect.Options, error) {
+	opts := redirect.DefaultOptions()
+	path := *ipRateLimitConfig
+	if path == "" {
+		return opts, nil
+	}
+
+	overrides, err := redirect.LoadIPRateLimitOverrides(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && !flagWasSet("ip-rate-limit-config") {
+			logger.Warnw("IP rate limit config not found; using default rate limit for all IPs", "path", path)
+			return opts, nil
+		}
+		return opts, fmt.Errorf("load IP rate limit config: %w", err)
+	}
+
+	opts.RateLimit.IPOverrides = overrides
+	logger.Infow("loaded IP rate limit config",
+		"path", path,
+		"overrides", len(overrides),
+		"ipRanges", countIPRateLimitRanges(overrides))
+	return opts, nil
+}
+
+func flagWasSet(name string) bool {
+	wasSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			wasSet = true
+		}
+	})
+	return wasSet
+}
+
+func countIPRateLimitRanges(overrides []redirect.IPRateLimitOverride) int {
+	count := 0
+	for _, override := range overrides {
+		count += len(override.IPPrefixes)
+	}
+	return count
+}
+
+func rateLimitedIPsHandler(tracker *redirect.RateLimitedIPTracker) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(tracker.Top()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+	})
 }

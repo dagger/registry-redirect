@@ -3,20 +3,35 @@ package redirect
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
+	"go4.org/netipx"
 	"golang.org/x/time/rate"
 )
 
 type ipRateLimiter struct {
-	mu       sync.Mutex
-	opts     RateLimitOptions
-	now      func() time.Time
-	limit    rate.Limit
-	clients  map[string]*ipLimiter
-	lastTrim time.Time
+	mu         sync.Mutex
+	opts       RateLimitOptions
+	now        func() time.Time
+	limit      rate.Limit
+	burst      int
+	overrides  []compiledIPRateLimitOverride
+	limitedIPs *RateLimitedIPTracker
+	clients    map[string]*ipLimiter
+	lastTrim   time.Time
+}
+
+type compiledIPRateLimitOverride struct {
+	rateLimit ipRateLimit
+	ipSet     *netipx.IPSet
+}
+
+type ipRateLimit struct {
+	limit rate.Limit
+	burst int
 }
 
 type ipLimiter struct {
@@ -25,11 +40,17 @@ type ipLimiter struct {
 }
 
 func newIPRateLimiter(opts RateLimitOptions) *ipRateLimiter {
+	overrides := compileIPRateLimitOverrides(opts.IPOverrides)
+	opts.IPOverrides = nil
+
 	return &ipRateLimiter{
-		opts:    opts,
-		now:     time.Now,
-		limit:   rate.Limit(float64(opts.RequestsPerMinute) / 60),
-		clients: map[string]*ipLimiter{},
+		opts:       opts,
+		now:        time.Now,
+		limit:      rate.Limit(float64(opts.RequestsPerMinute) / 60),
+		burst:      opts.Burst,
+		overrides:  overrides,
+		limitedIPs: opts.LimitedIPs,
+		clients:    map[string]*ipLimiter{},
 	}
 }
 
@@ -39,7 +60,9 @@ func (l *ipRateLimiter) wrap(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if !l.allow(clientIP(r)) {
+		ip := clientIP(r)
+		if !l.allow(ip) {
+			l.limitedIPs.Record(ip)
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -64,10 +87,15 @@ func isBlobRequest(r *http.Request) bool {
 }
 
 func (l *ipRateLimiter) allow(ip string) bool {
+	now := l.now()
+	client := l.client(ip, now)
+	return client.AllowN(now, 1)
+}
+
+func (l *ipRateLimiter) client(ip string, now time.Time) *rate.Limiter {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	now := l.now()
 	if l.lastTrim.IsZero() || now.Sub(l.lastTrim) >= time.Minute {
 		l.removeIdle(now)
 		l.lastTrim = now
@@ -81,15 +109,88 @@ func (l *ipRateLimiter) allow(ip string) bool {
 		for len(l.clients) >= l.opts.MaxIPs {
 			l.removeOldest()
 		}
+		rateLimit := l.rateLimitForIP(ip)
 		client = &ipLimiter{
-			limiter:  rate.NewLimiter(l.limit, l.opts.Burst),
+			limiter:  rate.NewLimiter(rateLimit.limit, rateLimit.burst),
 			lastSeen: now,
 		}
 		l.clients[ip] = client
 	}
 
 	client.lastSeen = now
-	return client.limiter.AllowN(now, 1)
+	return client.limiter
+}
+
+func compileIPRateLimitOverrides(overrides []IPRateLimitOverride) []compiledIPRateLimitOverride {
+	compiled := make([]compiledIPRateLimitOverride, 0, len(overrides))
+	for _, override := range overrides {
+		if override.RequestsPerMinute <= 0 || override.Burst <= 0 || len(override.IPPrefixes) == 0 {
+			continue
+		}
+		ipSet, err := newIPSet(override.IPPrefixes)
+		if err != nil || ipSet == nil {
+			continue
+		}
+		compiled = append(compiled, compiledIPRateLimitOverride{
+			rateLimit: ipRateLimit{
+				limit: rate.Limit(float64(override.RequestsPerMinute) / 60),
+				burst: override.Burst,
+			},
+			ipSet: ipSet,
+		})
+	}
+	return compiled
+}
+
+func (l *ipRateLimiter) rateLimitForIP(ip string) ipRateLimit {
+	defaultRateLimit := ipRateLimit{
+		limit: l.limit,
+		burst: l.burst,
+	}
+
+	if len(l.overrides) == 0 {
+		return defaultRateLimit
+	}
+
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return defaultRateLimit
+	}
+	addr = addr.Unmap()
+
+	for _, override := range l.overrides {
+		if override.ipSet.Contains(addr) {
+			return override.rateLimit
+		}
+	}
+	return defaultRateLimit
+}
+
+func newIPSet(prefixes []netip.Prefix) (*netipx.IPSet, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+
+	var builder netipx.IPSetBuilder
+	valid := 0
+	for _, prefix := range prefixes {
+		if !prefix.IsValid() {
+			continue
+		}
+		builder.AddPrefix(prefix.Masked())
+		valid++
+	}
+	if valid == 0 {
+		return nil, nil
+	}
+	ipSet, err := builder.IPSet()
+	if err != nil {
+		return nil, err
+	}
+	if len(ipSet.Ranges()) == 0 {
+		return nil, nil
+	}
+	return ipSet, nil
 }
 
 func (l *ipRateLimiter) removeIdle(now time.Time) {

@@ -79,3 +79,30 @@ This will tell clients to use GHCR creds to talk to the redirector, which will b
 ## Configuration
 
 You can use this to host other redirections, to ghcr.io (the default) or gcr.io (using `--gcr=true`).
+
+The redirector rate-limits non-blob requests per client IP. The default limit is
+120 requests per minute with a burst of 240 requests. To apply a different limit
+to selected IP addresses or CIDR ranges, pass `--ip-rate-limit-config` with a
+JSON file like:
+
+```json
+{
+  "rate_limit": {
+    "requests_per_minute": 480,
+    "burst": 960
+  },
+  "ip_ranges": [
+    "203.0.113.0/24",
+    "2001:db8::1"
+  ]
+}
+```
+
+The Dagger-built image includes `github-actions-rate-limit.json`, which applies
+that higher limit to the GitHub Actions ranges from `actions.json`.
+
+Refresh the included GitHub Actions ranges with:
+
+```
+dagger call update-git-hub-actions-rate-limit-config file --path github-actions-rate-limit.json export --path github-actions-rate-limit.json
+```

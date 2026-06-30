@@ -6,8 +6,8 @@ import (
 )
 
 const (
-	defaultRateLimitRequestsPerMinute = 120
-	defaultRateLimitBurst             = 240
+	defaultRateLimitRequestsPerMinute = 240
+	defaultRateLimitBurst             = 480
 	defaultRateLimitIdleTTL           = 10 * time.Minute
 	defaultRateLimitMaxIPs            = 10000
 	defaultManifestCacheMaxBytes      = 256 * 1024 * 1024
@@ -27,6 +27,8 @@ type RateLimitOptions struct {
 	Burst             int
 	IdleTTL           time.Duration
 	MaxIPs            int
+	IPOverrides       []IPRateLimitOverride
+	LimitedIPs        *RateLimitedIPTracker
 }
 
 type ManifestCacheOptions struct {
