@@ -3,6 +3,7 @@ package redirect
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -38,10 +39,35 @@ func TestNewBackendRequestClonesHeaders(t *testing.T) {
 	}
 }
 
+func TestBackendOperation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{"v2", "/v2/", "v2"},
+		{"ghcr token", "/token", "token"},
+		{"gcr token", "/v2/token", "token"},
+		{"manifest", "/v2/dagger/engine/manifests/latest", "manifests"},
+		{"blob", "/v2/dagger/engine/blobs/sha256:abc", "blobs"},
+		{"tags", "/v2/dagger/engine/tags/list", "tags"},
+		{"unknown", "/v2/dagger/engine/referrers/sha256:abc", "other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := backendOperation(tc.path); got != tc.want {
+				t.Fatalf("backendOperation(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDefaultOptionsSetsClientTimeout(t *testing.T) {
 	opts := DefaultOptions()
 	if opts.Client.Timeout != defaultBackendRequestTimeout {
 		t.Fatalf("client timeout = %s, want %s", opts.Client.Timeout, defaultBackendRequestTimeout)
+	}
+	if opts.BlobCache.MaxBytes != defaultBlobCacheMaxBytes {
+		t.Fatalf("blob cache max bytes = %d, want %d", opts.BlobCache.MaxBytes, defaultBlobCacheMaxBytes)
 	}
 }
 
@@ -58,5 +84,53 @@ func TestOptionsWithDefaultsCopiesCustomClientBeforeSettingTimeout(t *testing.T)
 	}
 	if custom.Timeout != 0 {
 		t.Fatalf("custom client timeout was mutated to %s", custom.Timeout)
+	}
+}
+
+func TestBlobRedirectCacheTTL(t *testing.T) {
+	now := time.Date(2026, 7, 2, 14, 18, 0, 0, time.UTC)
+	location := func(expiry time.Time) string {
+		return "https://pkg-containers.githubusercontent.com/ghcrblobs16/blobs/sha256:abc?se=" +
+			url.QueryEscape(expiry.Format(time.RFC3339)) + "&sig=test"
+	}
+
+	for _, tc := range []struct {
+		name     string
+		location string
+		want     time.Duration
+		wantOK   bool
+	}{
+		{
+			name:     "caps long signed URL lifetime",
+			location: location(now.Add(10 * time.Minute)),
+			want:     blobRedirectCacheMaxTTL,
+			wantOK:   true,
+		},
+		{
+			name:     "subtracts expiry margin",
+			location: location(now.Add(3 * time.Minute)),
+			want:     2 * time.Minute,
+			wantOK:   true,
+		},
+		{
+			name:     "rejects expiry inside margin",
+			location: location(now.Add(30 * time.Second)),
+			wantOK:   false,
+		},
+		{
+			name:     "rejects missing expiry",
+			location: "https://pkg-containers.githubusercontent.com/ghcrblobs16/blobs/sha256:abc?sig=test",
+			wantOK:   false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := blobRedirectCacheTTL(tc.location, now)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if got != tc.want {
+				t.Fatalf("ttl = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
