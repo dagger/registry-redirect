@@ -62,10 +62,17 @@ var (
 			Help:        "Number of in-flight outbound registry backend HTTP requests partitioned by registry, operation, and method.",
 			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
 		}, []string{"registry", "operation", "method"})
+
+	cacheHits = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:        "registry_cache_hits_total",
+			Help:        "Number of registry redirect cache hits partitioned by registry, operation, and method.",
+			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
+		}, []string{"registry", "operation", "method"})
 )
 
 func init() {
-	prometheus.MustRegister(backendRequests, backendResponses, backendErrors, backendLatency, backendInFlight)
+	prometheus.MustRegister(backendRequests, backendResponses, backendErrors, backendLatency, backendInFlight, cacheHits)
 }
 
 func redact(in http.Header) http.Header {
@@ -94,6 +101,13 @@ func NewWithOptions(host, repo, prefix string, opts Options) http.Handler {
 	}
 	if !opts.ManifestCache.Disabled {
 		rdr.manifestCache = newManifestCache(opts.ManifestCache.MaxBytes)
+	}
+	if !opts.BlobCache.Disabled {
+		blobCache, err := newBlobRedirectCache(opts.BlobCache.MaxBytes)
+		if err != nil {
+			panic(fmt.Sprintf("creating blob redirect cache: %v", err))
+		}
+		rdr.blobCache = blobCache
 	}
 	router := mux.NewRouter()
 
@@ -132,6 +146,7 @@ type redirect struct {
 	proxyClient   *http.Client
 	rateLimiter   *ipRateLimiter
 	manifestCache *manifestCache
+	blobCache     *blobRedirectCache
 }
 
 func noRedirectClient(client *http.Client, transport http.RoundTripper) *http.Client {
@@ -380,6 +395,13 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	blobCacheKey, isBlobRedirectCacheable := rdr.blobRedirectCacheKey(r, url)
+	if isBlobRedirectCacheable {
+		if entry, ok := rdr.blobCache.get(blobCacheKey); ok {
+			rdr.serveCachedBlobRedirect(w, r, url, entry)
+			return
+		}
+	}
 
 	req, err := newBackendRequest(ctx, r.Method, url, r.Header)
 	if err != nil {
@@ -482,6 +504,9 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 		rdr.proxyAndCacheManifest(w, resp, cacheKey)
 		return
 	}
+	if isBlobRedirectCacheable {
+		rdr.blobCache.set(blobCacheKey, resp, time.Now())
+	}
 
 	w.WriteHeader(resp.StatusCode)
 
@@ -497,6 +522,38 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 			logger.Errorf("Error copying response body: %v", err)
 		}
 	}
+}
+
+func (rdr redirect) blobRedirectCacheKey(r *http.Request, upstreamURL string) (string, bool) {
+	if rdr.blobCache == nil {
+		return "", false
+	}
+	if r.Method != http.MethodGet {
+		return "", false
+	}
+	if !strings.Contains(r.URL.Path, "/blobs/") {
+		return "", false
+	}
+	return r.Method + "\n" + upstreamURL, true
+}
+
+func (rdr redirect) serveCachedBlobRedirect(w http.ResponseWriter, r *http.Request, upstreamURL string, entry *blobRedirectCacheEntry) {
+	copyHeaders(w.Header(), entry.header)
+	w.Header().Set("X-Redirected", upstreamURL)
+	cacheHits.WithLabelValues(rdr.host, "blobs", r.Method).Inc()
+	rdr.logCachedBlobRedirect(w, r, upstreamURL, entry.status)
+	w.WriteHeader(entry.status)
+}
+
+func (rdr redirect) logCachedBlobRedirect(w http.ResponseWriter, r *http.Request, upstreamURL string, status int) {
+	logger := logging.FromContext(r.Context())
+	logger.Infow("serving cached blob redirect",
+		"method", r.Method,
+		"url", r.URL.String(),
+		"request_header", redact(r.Header),
+		"upstream_url", upstreamURL,
+		"status", fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		"response_header", redact(w.Header()))
 }
 
 func (rdr redirect) manifestCacheKey(r *http.Request, upstreamURL string) (string, bool) {
@@ -515,6 +572,7 @@ func (rdr redirect) manifestCacheKey(r *http.Request, upstreamURL string) (strin
 func (rdr redirect) serveCachedManifest(w http.ResponseWriter, r *http.Request, upstreamURL string, entry *manifestCacheEntry) {
 	copyHeaders(w.Header(), entry.header)
 	w.Header().Set("X-Redirected", upstreamURL)
+	cacheHits.WithLabelValues(rdr.host, "manifests", r.Method).Inc()
 
 	if ifNoneMatchMatches(r.Header.Get("If-None-Match"), entry.header) {
 		w.Header().Del("Content-Length")

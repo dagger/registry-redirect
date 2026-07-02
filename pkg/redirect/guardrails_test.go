@@ -6,11 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/chainguard-dev/registry-redirect/pkg/redirect"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 	"knative.dev/pkg/logging"
@@ -32,6 +35,40 @@ func upstreamResponse(status int, header http.Header, body string) *http.Respons
 	}
 }
 
+func prometheusCounterValue(t *testing.T, name string, labels map[string]string) float64 {
+	t.Helper()
+
+	metricFamilies, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gathering prometheus metrics: %v", err)
+	}
+	for _, family := range metricFamilies {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			if prometheusLabelsMatch(metric.GetLabel(), labels) {
+				if metric.Counter == nil {
+					t.Fatalf("%s is not a counter", name)
+				}
+				return metric.Counter.GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func prometheusLabelsMatch(got []*dto.LabelPair, want map[string]string) bool {
+	remaining := len(want)
+	for _, label := range got {
+		value, ok := want[label.GetName()]
+		if ok && value == label.GetValue() {
+			remaining--
+		}
+	}
+	return remaining == 0
+}
+
 func newGuardedRedirect(transport http.RoundTripper, cacheBytes int64) http.Handler {
 	return redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
 		Transport: transport,
@@ -40,6 +77,9 @@ func newGuardedRedirect(transport http.RoundTripper, cacheBytes int64) http.Hand
 		},
 		ManifestCache: redirect.ManifestCacheOptions{
 			MaxBytes: cacheBytes,
+		},
+		BlobCache: redirect.BlobCacheOptions{
+			Disabled: true,
 		},
 	})
 }
@@ -68,6 +108,11 @@ func TestManifestCacheCachesGET(t *testing.T) {
 			"Etag":                  {`"sha256:abc"`},
 		}, `{"schemaVersion":2}`), nil
 	}), 1024)
+	cacheHitsBefore := prometheusCounterValue(t, "registry_cache_hits_total", map[string]string{
+		"registry":  "ghcr.io",
+		"operation": "manifests",
+		"method":    http.MethodGet,
+	})
 
 	first := httptest.NewRecorder()
 	handler.ServeHTTP(first, manifestRequest(http.MethodGet, "v1", "application/vnd.oci.image.index.v1+json", true))
@@ -88,6 +133,13 @@ func TestManifestCacheCachesGET(t *testing.T) {
 	}
 	if got := second.Header().Get("X-Redirected"); got != "https://ghcr.io/v2/dagger/engine/manifests/v1" {
 		t.Fatalf("X-Redirected = %q", got)
+	}
+	if got := prometheusCounterValue(t, "registry_cache_hits_total", map[string]string{
+		"registry":  "ghcr.io",
+		"operation": "manifests",
+		"method":    http.MethodGet,
+	}) - cacheHitsBefore; got != 1 {
+		t.Fatalf("manifest cache hit metric delta = %v, want 1", got)
 	}
 }
 
@@ -430,6 +482,130 @@ func TestIPRateLimiterSkipsBlobRequests(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("second non-blob status = %d, want %d", rec.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestBlobRedirectCacheCachesSignedGETRedirects(t *testing.T) {
+	expiresAt := time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339)
+	location := "https://pkg-containers.githubusercontent.com/ghcrblobs16/blobs/sha256:abc?se=" +
+		url.QueryEscape(expiresAt) + "&sig=one"
+	calls := 0
+	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return upstreamResponse(http.StatusTemporaryRedirect, http.Header{
+				"Content-Length": {"0"},
+				"Location":       {location},
+			}, ""), nil
+		}),
+		RateLimit: redirect.RateLimitOptions{
+			Disabled: true,
+		},
+		ManifestCache: redirect.ManifestCacheOptions{
+			Disabled: true,
+		},
+		BlobCache: redirect.BlobCacheOptions{
+			MaxBytes: 1024 * 1024,
+		},
+	})
+	cacheHitsBefore := prometheusCounterValue(t, "registry_cache_hits_total", map[string]string{
+		"registry":  "ghcr.io",
+		"operation": "blobs",
+		"method":    http.MethodGet,
+	})
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v2/engine/blobs/sha256:abc", nil)
+		req.Header.Set("Authorization", "Bearer test")
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("blob request %d status = %d, want %d", i, rec.Code, http.StatusTemporaryRedirect)
+		}
+		if got := rec.Header().Get("Location"); got != location {
+			t.Fatalf("blob request %d Location = %q, want %q", i, got, location)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("upstream blob calls = %d, want 1", calls)
+	}
+	if got := prometheusCounterValue(t, "registry_cache_hits_total", map[string]string{
+		"registry":  "ghcr.io",
+		"operation": "blobs",
+		"method":    http.MethodGet,
+	}) - cacheHitsBefore; got != 1 {
+		t.Fatalf("blob cache hit metric delta = %v, want 1", got)
+	}
+}
+
+func TestBlobRedirectCacheSkipsRedirectsWithoutSignedExpiry(t *testing.T) {
+	calls := 0
+	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return upstreamResponse(http.StatusTemporaryRedirect, http.Header{
+				"Location": {"https://pkg-containers.githubusercontent.com/ghcrblobs16/blobs/sha256:abc?sig=one"},
+			}, ""), nil
+		}),
+		RateLimit: redirect.RateLimitOptions{
+			Disabled: true,
+		},
+		ManifestCache: redirect.ManifestCacheOptions{
+			Disabled: true,
+		},
+		BlobCache: redirect.BlobCacheOptions{
+			MaxBytes: 1024 * 1024,
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v2/engine/blobs/sha256:abc", nil)
+		req.Header.Set("Authorization", "Bearer test")
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("blob request %d status = %d, want %d", i, rec.Code, http.StatusTemporaryRedirect)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("upstream blob calls = %d, want 2", calls)
+	}
+}
+
+func TestBlobRedirectCacheSkipsRedirectsTooCloseToExpiry(t *testing.T) {
+	expiresAt := time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339)
+	location := "https://pkg-containers.githubusercontent.com/ghcrblobs16/blobs/sha256:abc?se=" +
+		url.QueryEscape(expiresAt) + "&sig=one"
+	calls := 0
+	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return upstreamResponse(http.StatusTemporaryRedirect, http.Header{
+				"Location": {location},
+			}, ""), nil
+		}),
+		RateLimit: redirect.RateLimitOptions{
+			Disabled: true,
+		},
+		ManifestCache: redirect.ManifestCacheOptions{
+			Disabled: true,
+		},
+		BlobCache: redirect.BlobCacheOptions{
+			MaxBytes: 1024 * 1024,
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v2/engine/blobs/sha256:abc", nil)
+		req.Header.Set("Authorization", "Bearer test")
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("blob request %d status = %d, want %d", i, rec.Code, http.StatusTemporaryRedirect)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("upstream blob calls = %d, want 2", calls)
 	}
 }
 

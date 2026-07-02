@@ -11,6 +11,7 @@ const (
 	defaultRateLimitIdleTTL           = 10 * time.Minute
 	defaultRateLimitMaxIPs            = 10000
 	defaultManifestCacheMaxBytes      = 256 * 1024 * 1024
+	defaultBlobCacheMaxBytes          = 512 * 1024 * 1024
 	defaultBackendRequestTimeout      = 5 * time.Second
 )
 
@@ -19,6 +20,7 @@ type Options struct {
 	Client        *http.Client
 	RateLimit     RateLimitOptions
 	ManifestCache ManifestCacheOptions
+	BlobCache     BlobCacheOptions
 }
 
 type RateLimitOptions struct {
@@ -32,6 +34,11 @@ type RateLimitOptions struct {
 }
 
 type ManifestCacheOptions struct {
+	Disabled bool
+	MaxBytes int64
+}
+
+type BlobCacheOptions struct {
 	Disabled bool
 	MaxBytes int64
 }
@@ -52,6 +59,9 @@ func DefaultOptions() Options {
 		},
 		ManifestCache: ManifestCacheOptions{
 			MaxBytes: defaultManifestCacheMaxBytes,
+		},
+		BlobCache: BlobCacheOptions{
+			MaxBytes: defaultBlobCacheMaxBytes,
 		},
 	}
 }
@@ -82,6 +92,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.ManifestCache.MaxBytes <= 0 {
 		o.ManifestCache.MaxBytes = defaults.ManifestCache.MaxBytes
+	}
+	if o.BlobCache.MaxBytes <= 0 {
+		o.BlobCache.MaxBytes = defaults.BlobCache.MaxBytes
 	}
 	return o
 }
