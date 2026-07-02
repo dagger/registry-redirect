@@ -38,6 +38,28 @@ func TestNewBackendRequestClonesHeaders(t *testing.T) {
 	}
 }
 
+func TestBackendOperation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want string
+	}{
+		{"v2", "/v2/", "v2"},
+		{"ghcr token", "/token", "token"},
+		{"gcr token", "/v2/token", "token"},
+		{"manifest", "/v2/dagger/engine/manifests/latest", "manifests"},
+		{"blob", "/v2/dagger/engine/blobs/sha256:abc", "blobs"},
+		{"tags", "/v2/dagger/engine/tags/list", "tags"},
+		{"unknown", "/v2/dagger/engine/referrers/sha256:abc", "other"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := backendOperation(tc.path); got != tc.want {
+				t.Fatalf("backendOperation(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDefaultOptionsSetsClientTimeout(t *testing.T) {
 	opts := DefaultOptions()
 	if opts.Client.Timeout != defaultBackendRequestTimeout {

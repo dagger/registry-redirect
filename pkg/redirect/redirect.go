@@ -15,13 +15,57 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus"
 	"knative.dev/pkg/logging"
 )
 
 var prefixlessHosts = map[string]bool{
 	"registry.dagger.io": true,
+}
+
+var (
+	backendRequests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:        "registry_backend_requests_total",
+			Help:        "Number of outbound registry backend HTTP requests partitioned by registry, operation, and method.",
+			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
+		}, []string{"registry", "operation", "method"})
+
+	backendResponses = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:        "registry_backend_responses_total",
+			Help:        "Number of outbound registry backend HTTP responses partitioned by registry, operation, method, and status code.",
+			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
+		}, []string{"registry", "operation", "method", "status"})
+
+	backendErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name:        "registry_backend_errors_total",
+			Help:        "Number of outbound registry backend HTTP request errors partitioned by registry, operation, method, and error class.",
+			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
+		}, []string{"registry", "operation", "method", "error"})
+
+	backendLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:        "registry_backend_request_duration_ms",
+			Help:        "Time spent waiting for outbound registry backend HTTP response headers partitioned by registry, operation, and method.",
+			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
+			Buckets:     []float64{10, 25, 50, 100, 250, 500, 1000, 2500, 5000},
+		}, []string{"registry", "operation", "method"})
+
+	backendInFlight = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name:        "registry_backend_in_flight_requests",
+			Help:        "Number of in-flight outbound registry backend HTTP requests partitioned by registry, operation, and method.",
+			ConstLabels: prometheus.Labels{"service": "registry-redirect"},
+		}, []string{"registry", "operation", "method"})
+)
+
+func init() {
+	prometheus.MustRegister(backendRequests, backendResponses, backendErrors, backendLatency, backendInFlight)
 }
 
 func redact(in http.Header) http.Header {
@@ -121,6 +165,64 @@ func backendErrorStatus(err error) int {
 	return http.StatusInternalServerError
 }
 
+func backendErrorClass(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return "timeout"
+	}
+	return "other"
+}
+
+func backendOperation(path string) string {
+	switch path {
+	case "/v2", "/v2/":
+		return "v2"
+	case "/token", "/v2/token":
+		return "token"
+	}
+
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) < 2 {
+		return "other"
+	}
+	if len(parts) >= 4 && parts[len(parts)-2] == "tags" && parts[len(parts)-1] == "list" {
+		return "tags"
+	}
+	for i := 1; i < len(parts)-1; i++ {
+		switch parts[i] {
+		case "manifests":
+			return "manifests"
+		case "blobs":
+			return "blobs"
+		}
+	}
+	return "other"
+}
+
+func (rdr redirect) doBackendRequest(client *http.Client, operation string, req *http.Request) (*http.Response, error) {
+	method := req.Method
+	backendRequests.WithLabelValues(rdr.host, operation, method).Inc()
+	backendInFlight.WithLabelValues(rdr.host, operation, method).Inc()
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	backendLatency.WithLabelValues(rdr.host, operation, method).Observe(float64(time.Since(start).Milliseconds()))
+	backendInFlight.WithLabelValues(rdr.host, operation, method).Dec()
+	if err != nil {
+		backendErrors.WithLabelValues(rdr.host, operation, method, backendErrorClass(err)).Inc()
+		return nil, err
+	}
+
+	backendResponses.WithLabelValues(rdr.host, operation, method, strconv.Itoa(resp.StatusCode)).Inc()
+	return resp, nil
+}
+
 func (rdr redirect) v2(resp http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
 	logger := logging.FromContext(ctx)
@@ -144,7 +246,7 @@ func (rdr redirect) v2(resp http.ResponseWriter, req *http.Request) {
 		"header", redact(req.Header))
 	resp.Header().Set("X-Redirected", req.URL.String())
 
-	back, err := rdr.client.Do(out)
+	back, err := rdr.doBackendRequest(rdr.client, "v2", out)
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
 		http.Error(resp, err.Error(), backendErrorStatus(err))
@@ -215,7 +317,7 @@ func (rdr redirect) token(w http.ResponseWriter, r *http.Request) {
 		"header", redact(req.Header))
 	w.Header().Set("X-Redirected", req.URL.String())
 
-	resp, err := rdr.client.Do(req)
+	resp, err := rdr.doBackendRequest(rdr.client, "token", req)
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
 		http.Error(w, err.Error(), backendErrorStatus(err))
@@ -312,7 +414,7 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 		"header", redact(req.Header))
 	w.Header().Set("X-Redirected", req.URL.String())
 
-	resp, err := rdr.proxyClient.Do(req)
+	resp, err := rdr.doBackendRequest(rdr.proxyClient, backendOperation(req.URL.Path), req)
 	if err != nil {
 		logger.Errorf("Error sending request: %v", err)
 		http.Error(w, err.Error(), backendErrorStatus(err))
@@ -527,7 +629,7 @@ func (rdr redirect) getToken(r *http.Request) (string, *http.Response, error) {
 		return "", nil, err
 	}
 
-	resp, err := rdr.client.Do(req) //nolint:gosec
+	resp, err := rdr.doBackendRequest(rdr.client, "auth_token", req) //nolint:gosec
 	if err != nil {
 		return "", nil, err
 	}
