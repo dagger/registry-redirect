@@ -80,8 +80,11 @@ This will tell clients to use GHCR creds to talk to the redirector, which will b
 
 You can use this to host other redirections, to ghcr.io (the default) or gcr.io (using `--gcr=true`).
 
-The redirector rate-limits non-blob requests per client IP. The default limit is
-120 requests per minute with a burst of 240 requests. To apply a different limit
+The redirector rate-limits non-blob requests per client IP, charging only when
+a request needs upstream data. Manifest cache hits and local responses are
+free. An anonymous token fetch followed by a manifest fetch costs one charge
+for the incoming request. The default limit is 240 requests per minute with
+a burst of 480 requests. To apply a different limit
 to selected IP addresses or CIDR ranges, pass `--ip-rate-limit-config` with a
 JSON file like:
 

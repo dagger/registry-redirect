@@ -71,6 +71,30 @@ func TestDefaultOptionsSetsClientTimeout(t *testing.T) {
 	}
 }
 
+func TestDefaultOptionsTransportRaisesIdleLimitsWithoutTouchingGlobal(t *testing.T) {
+	opts := DefaultOptions()
+
+	transport, ok := opts.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("default transport is %T, want *http.Transport", opts.Transport)
+	}
+	if transport.MaxIdleConnsPerHost != defaultTransportMaxIdleConnsPerHost {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want %d", transport.MaxIdleConnsPerHost, defaultTransportMaxIdleConnsPerHost)
+	}
+	if transport.MaxIdleConns != defaultTransportMaxIdleConns {
+		t.Fatalf("MaxIdleConns = %d, want %d", transport.MaxIdleConns, defaultTransportMaxIdleConns)
+	}
+
+	if opts.Client.Transport != opts.Transport {
+		t.Fatal("default client does not use the default transport")
+	}
+
+	global := http.DefaultTransport.(*http.Transport)
+	if transport == global {
+		t.Fatal("DefaultOptions returned http.DefaultTransport itself instead of a clone")
+	}
+}
+
 func TestOptionsWithDefaultsCopiesCustomClientBeforeSettingTimeout(t *testing.T) {
 	custom := &http.Client{}
 
@@ -84,6 +108,26 @@ func TestOptionsWithDefaultsCopiesCustomClientBeforeSettingTimeout(t *testing.T)
 	}
 	if custom.Timeout != 0 {
 		t.Fatalf("custom client timeout was mutated to %s", custom.Timeout)
+	}
+}
+
+func TestOptionsWithDefaultsUsesTransport(t *testing.T) {
+	custom := &http.Transport{}
+	for _, transport := range []*http.Transport{nil, custom} {
+		input := Options{}
+		if transport != nil {
+			input.Transport = transport
+		}
+		opts := input.withDefaults()
+		if opts.Client.Transport != opts.Transport {
+			t.Fatal("client and proxy must use the same transport")
+		}
+		if transport != nil && opts.Transport != transport {
+			t.Fatal("custom transport was replaced")
+		}
+		if opts.Client.Timeout != defaultBackendRequestTimeout {
+			t.Fatalf("client timeout = %s, want %s", opts.Client.Timeout, defaultBackendRequestTimeout)
+		}
 	}
 }
 
