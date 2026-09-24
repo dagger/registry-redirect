@@ -2,8 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
@@ -93,6 +97,64 @@ func TestRateLimitedIPsHandlerRejectsNonGET(t *testing.T) {
 	}
 	if got := rec.Header().Get("Allow"); got != http.MethodGet {
 		t.Fatalf("Allow = %q, want %q", got, http.MethodGet)
+	}
+}
+
+func TestSplitIPRateLimitConfigPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  []string
+	}{
+		{"single", "a.json", []string{"a.json"}},
+		{"two", "a.json,b.json", []string{"a.json", "b.json"}},
+		{"whitespace and trailing comma", " a.json , b.json ,", []string{"a.json", "b.json"}},
+		{"empty disables", "", nil},
+		{"only commas", ",,", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := splitIPRateLimitConfigPaths(tc.value); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("splitIPRateLimitConfigPaths(%q) = %#v, want %#v", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+func writeRateLimitConfig(t *testing.T, name string, rpm, burst int, ranges string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	body := fmt.Sprintf(`{"rate_limit":{"requests_per_minute":%d,"burst":%d},"ip_ranges":[%s]}`, rpm, burst, ranges)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadIPRateLimitOverridesKeepsFileOrder(t *testing.T) {
+	first := writeRateLimitConfig(t, "first.json", 480, 960, `"203.0.113.0/24"`)
+	second := writeRateLimitConfig(t, "second.json", 120, 240, `"198.51.100.0/24"`)
+
+	overrides, err := loadIPRateLimitOverrides([]string{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overrides) != 2 {
+		t.Fatalf("overrides = %d, want 2", len(overrides))
+	}
+	// Order is precedence: the limiter applies the first matching override.
+	if overrides[0].RequestsPerMinute != 480 || overrides[1].RequestsPerMinute != 120 {
+		t.Fatalf("override order = [%d, %d], want [480, 120]",
+			overrides[0].RequestsPerMinute, overrides[1].RequestsPerMinute)
+	}
+}
+
+func TestLoadIPRateLimitOverridesMissingFileIsNotExist(t *testing.T) {
+	first := writeRateLimitConfig(t, "first.json", 480, 960, `"203.0.113.0/24"`)
+	missing := filepath.Join(t.TempDir(), "missing.json")
+
+	_, err := loadIPRateLimitOverrides([]string{first, missing})
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("err = %v, want os.ErrNotExist so redirectOptions can distinguish an unset flag", err)
 	}
 }
 

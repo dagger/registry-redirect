@@ -86,8 +86,9 @@ the manifest, blob, token or `/v2/` cache costs nothing. An anonymous token
 fetch followed by a manifest fetch costs one charge for the incoming request.
 The default limit is
 240 requests per minute with a burst of 480. To apply a different limit to
-selected IP addresses or CIDR ranges, pass `--ip-rate-limit-config` with a
-JSON file like:
+selected IP addresses or CIDR ranges, pass `--ip-rate-limit-config` with one
+or more JSON files, comma-separated; earlier files take precedence. Each file
+looks like:
 
 ```json
 {
@@ -102,14 +103,21 @@ JSON file like:
 }
 ```
 
-The Dagger-built image includes `github-actions-rate-limit.json`, which applies
-that higher limit to the GitHub Actions ranges from `actions.json`.
+The Dagger-built image includes two such files, and `fly.toml` passes both:
 
-Refresh the included GitHub Actions ranges with:
+- `github-actions-rate-limit.json` applies the higher limit to the GitHub
+  Actions ranges from `actions.json`. Refresh it with:
 
-```
-dagger call update-git-hub-actions-rate-limit-config file --path github-actions-rate-limit.json export --path github-actions-rate-limit.json
-```
+  ```
+  dagger call update-git-hub-actions-rate-limit-config file --path github-actions-rate-limit.json export --path github-actions-rate-limit.json
+  ```
+
+- `namespace-rate-limit.json` applies it to the Namespace egress hosts that
+  Dagger CI runs on. It is a separate file so a refresh of the GitHub ranges
+  cannot overwrite it.
+
+When the flag is passed explicitly, a listed file that does not exist is a
+fatal error at startup rather than a warning.
 
 Anonymous client `/token` requests and proxy token fetches share one cache
 and one in-flight fetch for matching upstream URLs. The cache holds at most

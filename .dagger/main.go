@@ -12,12 +12,19 @@ const (
 	alpineVersion       = "3.23@sha256:865b95f46d98cf867a156fe4a135ad3fe50d2056aa3f25ed31662dff6da4eb62"
 	flyctlVersion       = "0.1.78"
 
-	appName           = "dagger-registry-2023-01-23"
-	appImageRegistry  = "registry.fly.io"
-	binaryName        = "registry-redirect"
-	ipRateLimitConfig = "github-actions-rate-limit.json"
-	githubMetaURL     = "https://api.github.com/meta"
+	appName                  = "dagger-registry-2023-01-23"
+	appImageRegistry         = "registry.fly.io"
+	binaryName               = "registry-redirect"
+	ipRateLimitConfig        = "github-actions-rate-limit.json"
+	namespaceRateLimitConfig = "namespace-rate-limit.json"
+	githubMetaURL            = "https://api.github.com/meta"
 )
+
+// rateLimitConfigs are bundled into the image and listed, in this order, in
+// the -ip-rate-limit-config flag in fly.toml. ipRateLimitConfig is rewritten
+// by UpdateGitHubActionsRateLimitConfig, so tenant-specific ranges live in
+// their own file where a regeneration cannot clobber them.
+var rateLimitConfigs = []string{ipRateLimitConfig, namespaceRateLimitConfig}
 
 type DaggerRegistry struct {
 	Source *dagger.Directory
@@ -56,10 +63,13 @@ func (m *DaggerRegistry) Build(ctx context.Context) *dagger.Container {
 		WithExec([]string{"sh", "-c", fmt.Sprintf("go build -o /app/%s", binaryName)}).
 		File(fmt.Sprintf("/app/%s", binaryName))
 
-	return dag.Container().
+	ctr := dag.Container().
 		From("alpine:"+alpineVersion).
-		WithFile(fmt.Sprintf("/app/%s", binaryName), binary).
-		WithFile(fmt.Sprintf("/app/%s", ipRateLimitConfig), m.Source.File(ipRateLimitConfig)).
+		WithFile(fmt.Sprintf("/app/%s", binaryName), binary)
+	for _, config := range rateLimitConfigs {
+		ctr = ctr.WithFile(fmt.Sprintf("/app/%s", config), m.Source.File(config))
+	}
+	return ctr.
 		WithWorkdir("/app").
 		WithEntrypoint([]string{fmt.Sprintf("/app/%s", binaryName)})
 }

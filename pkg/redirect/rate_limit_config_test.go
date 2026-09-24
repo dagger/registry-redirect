@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/chainguard-dev/registry-redirect/pkg/redirect"
@@ -87,5 +88,27 @@ func TestShippedGitHubActionsRateLimitConfig(t *testing.T) {
 	}
 	if len(override.IPPrefixes) == 0 {
 		t.Fatal("expected at least one GitHub Actions IP prefix")
+	}
+}
+
+func TestShippedNamespaceRateLimitConfig(t *testing.T) {
+	overrides, err := redirect.LoadIPRateLimitOverrides(filepath.Join("..", "..", "namespace-rate-limit.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overrides) != 1 {
+		t.Fatalf("overrides = %d, want 1", len(overrides))
+	}
+
+	override := overrides[0]
+	if override.RequestsPerMinute != 480 {
+		t.Fatalf("requests per minute = %d, want 480", override.RequestsPerMinute)
+	}
+	if override.Burst != 960 {
+		t.Fatalf("burst = %d, want 960", override.Burst)
+	}
+	want := []netip.Prefix{netip.MustParsePrefix("64.6.39.249/32"), netip.MustParsePrefix("64.6.39.250/32")}
+	if !slices.Equal(override.IPPrefixes, want) {
+		t.Fatalf("Namespace prefixes = %v, want %v", override.IPPrefixes, want)
 	}
 }
