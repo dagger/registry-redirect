@@ -136,3 +136,4 @@ For offline tests, including concurrent cache and limiter cases, run
 The Go tests cover concurrent cached and uncached requests, blob redirects,
 and shared token fetches. Concurrency and expiry tests use `testing/synctest`
 to avoid timing-dependent waits. CI runs these through `dagger checks`.
+Images are published only from main-branch runs.
