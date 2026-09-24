@@ -80,12 +80,13 @@ This will tell clients to use GHCR creds to talk to the redirector, which will b
 
 You can use this to host other redirections, to ghcr.io (the default) or gcr.io (using `--gcr=true`).
 
-The redirector rate-limits non-blob requests per client IP, charging only when
-a request needs upstream data. Manifest cache hits and local responses are
-free. An anonymous token fetch followed by a manifest fetch costs one charge
-for the incoming request. The default limit is 240 requests per minute with
-a burst of 480 requests. To apply a different limit
-to selected IP addresses or CIDR ranges, pass `--ip-rate-limit-config` with a
+The redirector rate-limits non-blob requests per client IP, and charges a
+request only when it needs upstream data: a request answered from
+the manifest, blob, token or `/v2/` cache costs nothing. An anonymous token
+fetch followed by a manifest fetch costs one charge for the incoming request.
+The default limit is
+240 requests per minute with a burst of 480. To apply a different limit to
+selected IP addresses or CIDR ranges, pass `--ip-rate-limit-config` with a
 JSON file like:
 
 ```json
@@ -109,3 +110,21 @@ Refresh the included GitHub Actions ranges with:
 ```
 dagger call update-git-hub-actions-rate-limit-config file --path github-actions-rate-limit.json export --path github-actions-rate-limit.json
 ```
+
+Anonymous client `/token` requests and proxy token fetches share one cache
+and one in-flight fetch for matching upstream URLs. The cache holds at most
+1024 responses for 45 seconds; `/v2/` holds one response for 60 seconds.
+Each caller that misses the token cache spends its own rate-limit charge
+before joining a fetch. A canceled caller stops waiting while the shared
+fetch continues within the upstream client's timeout.
+
+## Testing
+
+`go test ./...` runs all tests, including image pulls from ghcr.io.
+
+For offline tests, including concurrent cache and limiter cases, run
+`go test -race ./... -skip '^(TestRedirect|TestPrefixlessHosts)$'`.
+
+The Go tests cover concurrent cached and uncached requests, blob redirects,
+and shared token fetches. Concurrency and expiry tests use `testing/synctest`
+to avoid timing-dependent waits. CI runs these through `dagger checks`.

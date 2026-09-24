@@ -26,6 +26,20 @@ type Options struct {
 	RateLimit     RateLimitOptions
 	ManifestCache ManifestCacheOptions
 	BlobCache     BlobCacheOptions
+	TokenCache    TokenCacheOptions
+	V2Cache       V2CacheOptions
+}
+
+// TokenCacheOptions controls anonymous token caching for both the client
+// /token endpoint and the tokens the proxy fetches for itself.
+type TokenCacheOptions struct {
+	Disabled bool
+}
+
+// V2CacheOptions controls the cache of the upstream /v2/ answer, which is a
+// constant challenge for anonymous callers.
+type V2CacheOptions struct {
+	Disabled bool
 }
 
 type RateLimitOptions struct {

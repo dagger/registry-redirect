@@ -72,6 +72,10 @@ func limitedRedirect(transport http.RoundTripper, burst int, cacheBytes int64, t
 			MaxBytes: cacheBytes,
 		},
 		BlobCache: redirect.BlobCacheOptions{Disabled: true},
+		// Limiter tests reason about charges per upstream call; keep the
+		// token and /v2 caches out of it so every request is a real fetch.
+		TokenCache: redirect.TokenCacheOptions{Disabled: true},
+		V2Cache:    redirect.V2CacheOptions{Disabled: true},
 	})
 }
 
