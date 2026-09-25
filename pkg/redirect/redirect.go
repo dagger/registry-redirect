@@ -19,6 +19,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/singleflight"
 	"knative.dev/pkg/logging"
 )
 
@@ -89,7 +90,7 @@ func New(host, repo, prefix string) http.Handler {
 
 func NewWithOptions(host, repo, prefix string, opts Options) http.Handler {
 	opts = opts.withDefaults()
-	rdr := redirect{
+	rdr := &redirect{
 		host:        host,
 		repo:        repo,
 		prefix:      prefix,
@@ -108,6 +109,12 @@ func NewWithOptions(host, repo, prefix string, opts Options) http.Handler {
 			panic(fmt.Sprintf("creating blob redirect cache: %v", err))
 		}
 		rdr.blobCache = blobCache
+	}
+	if !opts.TokenCache.Disabled {
+		rdr.tokenCache = newResponseCache(anonymousTokenTTL, tokenCacheMaxEntries)
+	}
+	if !opts.V2Cache.Disabled {
+		rdr.v2Cache = newResponseCache(v2CacheTTL, 1)
 	}
 	router := mux.NewRouter()
 
@@ -132,10 +139,7 @@ func NewWithOptions(host, repo, prefix string, opts Options) http.Handler {
 		resp.WriteHeader(http.StatusNotFound)
 	})
 
-	if rdr.rateLimiter == nil {
-		return router
-	}
-	return rdr.rateLimiter.wrap(router)
+	return router
 }
 
 type redirect struct {
@@ -147,6 +151,9 @@ type redirect struct {
 	rateLimiter   *ipRateLimiter
 	manifestCache *manifestCache
 	blobCache     *blobRedirectCache
+	tokenCache    *responseCache
+	v2Cache       *responseCache
+	tokenGroup    singleflight.Group
 }
 
 func noRedirectClient(client *http.Client, transport http.RoundTripper) *http.Client {
@@ -178,6 +185,11 @@ func backendErrorStatus(err error) int {
 		return http.StatusGatewayTimeout
 	}
 	return http.StatusInternalServerError
+}
+
+func writeBackendError(ctx context.Context, w http.ResponseWriter, what string, err error) {
+	logging.FromContext(ctx).Errorf("Error %s: %v", what, err)
+	http.Error(w, err.Error(), backendErrorStatus(err))
 }
 
 func backendErrorClass(err error) string {
@@ -220,7 +232,7 @@ func backendOperation(path string) string {
 	return "other"
 }
 
-func (rdr redirect) doBackendRequest(client *http.Client, operation string, req *http.Request) (*http.Response, error) {
+func (rdr *redirect) doBackendRequest(client *http.Client, operation string, req *http.Request) (*http.Response, error) {
 	method := req.Method
 	backendRequests.WithLabelValues(rdr.host, operation, method).Inc()
 	backendInFlight.WithLabelValues(rdr.host, operation, method).Inc()
@@ -238,126 +250,7 @@ func (rdr redirect) doBackendRequest(client *http.Client, operation string, req 
 	return resp, nil
 }
 
-func (rdr redirect) v2(resp http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
-	logger := logging.FromContext(ctx)
-
-	var url string
-	if rdr.host == "gcr.io" {
-		url = "https://gcr.io/v2/"
-	} else {
-		url = "https://ghcr.io/v2/"
-	}
-	out, err := newBackendRequest(ctx, req.Method, url, nil)
-	if err != nil {
-		logger.Errorf("Error creating request: %v", err)
-		http.Error(resp, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	logger.Infow("sending request",
-		"method", req.Method,
-		"url", req.URL.String(),
-		"header", redact(req.Header))
-	resp.Header().Set("X-Redirected", req.URL.String())
-
-	back, err := rdr.doBackendRequest(rdr.client, "v2", out)
-	if err != nil {
-		logger.Errorf("Error sending request: %v", err)
-		http.Error(resp, err.Error(), backendErrorStatus(err))
-		return
-	}
-	defer back.Body.Close()
-
-	logger.Infow("got response",
-		"method", req.Method,
-		"url", req.URL.String(),
-		"status", back.Status,
-		"header", redact(back.Header))
-
-	for k, v := range back.Header {
-		for _, vv := range v {
-			if k == "Www-Authenticate" {
-				log.Println("=== BEFORE: Www-Authenticate:", vv)
-				if rdr.host == "gcr.io" {
-					// GCR's token endpoint is /v2/token, we want callers to hit us at /token.
-					vv = strings.Replace(vv, `realm="https://gcr.io/v2/`, fmt.Sprintf(`realm="https://%s/`, req.Host), 1)
-				} else {
-					vv = strings.Replace(vv, `realm="https://ghcr.io/`, fmt.Sprintf(`realm="https://%s/`, req.Host), 1)
-				}
-				log.Println("=== CHANGED: Www-Authenticate:", vv)
-			}
-			resp.Header().Add(k, vv)
-		}
-	}
-	resp.WriteHeader(back.StatusCode)
-	if _, err := io.Copy(resp, back.Body); err != nil {
-		logger.Errorf("Error copying response body: %v", err)
-	}
-}
-
-func (rdr redirect) token(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	logger := logging.FromContext(ctx)
-
-	vals := r.URL.Query()
-	if rdr.prefix != "" {
-		scope := vals.Get("scope")
-		scope = strings.Replace(scope, rdr.prefix+"/", "", 1)
-		vals.Set("scope", scope)
-	}
-	if rdr.repo != "" {
-		scope := vals.Get("scope")
-		scope = strings.Replace(scope, "repository:", "repository:"+rdr.repo+"/", 1)
-		vals.Set("scope", scope)
-	}
-
-	var url string
-	if rdr.host == "gcr.io" {
-		url = "https://gcr.io/v2/token?" + vals.Encode()
-	} else {
-		url = "https://ghcr.io/token?" + vals.Encode()
-	}
-
-	req, err := newBackendRequest(ctx, r.Method, url, r.Header)
-	if err != nil {
-		logger.Errorf("Error creating request: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	logger.Infow("sending request",
-		"method", req.Method,
-		"url", req.URL.String(),
-		"header", redact(req.Header))
-	w.Header().Set("X-Redirected", req.URL.String())
-
-	resp, err := rdr.doBackendRequest(rdr.client, "token", req)
-	if err != nil {
-		logger.Errorf("Error sending request: %v", err)
-		http.Error(w, err.Error(), backendErrorStatus(err))
-		return
-	}
-	defer resp.Body.Close()
-
-	logger.Infow("got response",
-		"method", req.Method,
-		"url", req.URL.String(),
-		"status", resp.Status,
-		"header", redact(resp.Header))
-
-	for k, v := range resp.Header {
-		for _, vv := range v {
-			w.Header().Add(k, vv)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		logger.Errorf("Error copying response body: %v", err)
-	}
-}
-
-func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
+func (rdr *redirect) proxy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := logging.FromContext(ctx)
 
@@ -410,21 +303,26 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !rdr.rateLimiter.allowRequest(r) {
+		writeRateLimited(w)
+		return
+	}
+
 	// If the request is coming in without auth, get some auth.
 	// This is useful for testing, but should never happen in real life.
 	// Actually, containerd seems to make unauthenticated HEAD requests before
 	// hitting /v2/, so this might be load-bearing.
 	if req.Header.Get("Authorization") == "" {
 		logger.Warnw("request without Authorization header, getting auth")
-		t, resp, err := rdr.getToken(r)
+		t, err := rdr.getToken(r)
 		if err != nil {
-			if resp != nil {
-				logger.Infof("Error response getting token: %d %s", resp.StatusCode, resp.Status)
-				http.Error(w, resp.Status, resp.StatusCode)
+			var statusErr *tokenStatusError
+			if errors.As(err, &statusErr) {
+				logger.Infof("Error response getting token: %d %s", statusErr.code, statusErr.status)
+				http.Error(w, statusErr.status, statusErr.code)
 				return
 			}
-			logger.Errorf("Error getting token: %v", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeBackendError(ctx, w, "getting token", err)
 			return
 		}
 		req.Header.Set("Authorization", "Bearer "+t)
@@ -438,8 +336,7 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := rdr.doBackendRequest(rdr.proxyClient, backendOperation(req.URL.Path), req)
 	if err != nil {
-		logger.Errorf("Error sending request: %v", err)
-		http.Error(w, err.Error(), backendErrorStatus(err))
+		writeBackendError(ctx, w, "sending request", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -524,7 +421,7 @@ func (rdr redirect) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (rdr redirect) blobRedirectCacheKey(r *http.Request, upstreamURL string) (string, bool) {
+func (rdr *redirect) blobRedirectCacheKey(r *http.Request, upstreamURL string) (string, bool) {
 	if rdr.blobCache == nil {
 		return "", false
 	}
@@ -537,7 +434,7 @@ func (rdr redirect) blobRedirectCacheKey(r *http.Request, upstreamURL string) (s
 	return r.Method + "\n" + upstreamURL, true
 }
 
-func (rdr redirect) serveCachedBlobRedirect(w http.ResponseWriter, r *http.Request, upstreamURL string, entry *blobRedirectCacheEntry) {
+func (rdr *redirect) serveCachedBlobRedirect(w http.ResponseWriter, r *http.Request, upstreamURL string, entry *blobRedirectCacheEntry) {
 	copyHeaders(w.Header(), entry.header)
 	w.Header().Set("X-Redirected", upstreamURL)
 	cacheHits.WithLabelValues(rdr.host, "blobs", r.Method).Inc()
@@ -545,7 +442,7 @@ func (rdr redirect) serveCachedBlobRedirect(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(entry.status)
 }
 
-func (rdr redirect) logCachedBlobRedirect(w http.ResponseWriter, r *http.Request, upstreamURL string, status int) {
+func (rdr *redirect) logCachedBlobRedirect(w http.ResponseWriter, r *http.Request, upstreamURL string, status int) {
 	logger := logging.FromContext(r.Context())
 	logger.Infow("serving cached blob redirect",
 		"method", r.Method,
@@ -556,7 +453,7 @@ func (rdr redirect) logCachedBlobRedirect(w http.ResponseWriter, r *http.Request
 		"response_header", redact(w.Header()))
 }
 
-func (rdr redirect) manifestCacheKey(r *http.Request, upstreamURL string) (string, bool) {
+func (rdr *redirect) manifestCacheKey(r *http.Request, upstreamURL string) (string, bool) {
 	if rdr.manifestCache == nil {
 		return "", false
 	}
@@ -569,7 +466,7 @@ func (rdr redirect) manifestCacheKey(r *http.Request, upstreamURL string) (strin
 	return upstreamURL + "\naccept:" + r.Header.Get("Accept"), true
 }
 
-func (rdr redirect) serveCachedManifest(w http.ResponseWriter, r *http.Request, upstreamURL string, entry *manifestCacheEntry) {
+func (rdr *redirect) serveCachedManifest(w http.ResponseWriter, r *http.Request, upstreamURL string, entry *manifestCacheEntry) {
 	copyHeaders(w.Header(), entry.header)
 	w.Header().Set("X-Redirected", upstreamURL)
 	cacheHits.WithLabelValues(rdr.host, "manifests", r.Method).Inc()
@@ -592,7 +489,7 @@ func (rdr redirect) serveCachedManifest(w http.ResponseWriter, r *http.Request, 
 	_, _ = w.Write(entry.body)
 }
 
-func (rdr redirect) logCachedManifest(w http.ResponseWriter, r *http.Request, upstreamURL string, status int) {
+func (rdr *redirect) logCachedManifest(w http.ResponseWriter, r *http.Request, upstreamURL string, status int) {
 	logger := logging.FromContext(r.Context())
 	logger.Infow("serving cached manifest",
 		"method", r.Method,
@@ -603,7 +500,7 @@ func (rdr redirect) logCachedManifest(w http.ResponseWriter, r *http.Request, up
 		"response_header", redact(w.Header()))
 }
 
-func (rdr redirect) proxyAndCacheManifest(w http.ResponseWriter, resp *http.Response, cacheKey string) {
+func (rdr *redirect) proxyAndCacheManifest(w http.ResponseWriter, resp *http.Response, cacheKey string) {
 	body, tooLarge, err := readBodyWithLimit(resp.Body, rdr.manifestCache.maxBodyBytes())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -665,43 +562,6 @@ func ifNoneMatchMatches(value string, header http.Header) bool {
 		}
 	}
 	return false
-}
-
-func (rdr redirect) getToken(r *http.Request) (string, *http.Response, error) {
-	parts := strings.Split(r.URL.Path, "/")
-	parts = parts[2 : len(parts)-2]
-	if rdr.prefix != "" && parts[0] == rdr.prefix {
-		parts = parts[1:]
-	}
-	if rdr.repo != "" {
-		parts = append([]string{rdr.repo}, parts...)
-	}
-	var url string
-	if rdr.host == "gcr.io" {
-		url = fmt.Sprintf("https://gcr.io/v2/token?scope=repository:%s:pull&service=gcr.io", strings.Join(parts, "/"))
-	} else {
-		url = fmt.Sprintf("https://ghcr.io/token?scope=repository:%s:pull&service=ghcr.io", strings.Join(parts, "/"))
-	}
-	req, err := newBackendRequest(r.Context(), http.MethodGet, url, r.Header)
-	if err != nil {
-		return "", nil, err
-	}
-
-	resp, err := rdr.doBackendRequest(rdr.client, "auth_token", req) //nolint:gosec
-	if err != nil {
-		return "", nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", resp, fmt.Errorf("error getting token: %v", resp.Status)
-	}
-	var t struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
-		return "", nil, err
-	}
-	return t.Token, nil, nil
 }
 
 type listResponse struct {

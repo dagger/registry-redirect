@@ -52,7 +52,7 @@ var (
 	// (this is for backward compatibility with prefix-less redirects)
 	prefix = flag.String("prefix", "", "if set, user-visible repo prefix")
 
-	ipRateLimitConfig = flag.String("ip-rate-limit-config", defaultIPRateLimitConfigPath, "JSON file with IP-specific rate limit overrides; set empty to disable")
+	ipRateLimitConfig = flag.String("ip-rate-limit-config", defaultIPRateLimitConfigPath, "comma-separated JSON files with IP-specific rate limit overrides, earlier files take precedence; set empty to disable")
 )
 
 func main() {
@@ -260,15 +260,15 @@ func (h *CustomHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func redirectOptions(logger *zap.SugaredLogger) (redirect.Options, error) {
 	opts := redirect.DefaultOptions()
-	path := *ipRateLimitConfig
-	if path == "" {
+	paths := splitIPRateLimitConfigPaths(*ipRateLimitConfig)
+	if len(paths) == 0 {
 		return opts, nil
 	}
 
-	overrides, err := redirect.LoadIPRateLimitOverrides(path)
+	overrides, err := loadIPRateLimitOverrides(paths)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) && !flagWasSet("ip-rate-limit-config") {
-			logger.Warnw("IP rate limit config not found; using default rate limit for all IPs", "path", path)
+			logger.Warnw("IP rate limit config not found; using default rate limit for all IPs", "paths", paths)
 			return opts, nil
 		}
 		return opts, fmt.Errorf("load IP rate limit config: %w", err)
@@ -276,10 +276,38 @@ func redirectOptions(logger *zap.SugaredLogger) (redirect.Options, error) {
 
 	opts.RateLimit.IPOverrides = overrides
 	logger.Infow("loaded IP rate limit config",
-		"path", path,
+		"paths", paths,
 		"overrides", len(overrides),
 		"ipRanges", countIPRateLimitRanges(overrides))
 	return opts, nil
+}
+
+// splitIPRateLimitConfigPaths turns the comma-separated flag value into
+// paths, dropping empty entries so whitespace and a trailing comma are
+// harmless.
+func splitIPRateLimitConfigPaths(value string) []string {
+	var paths []string
+	for _, path := range strings.Split(value, ",") {
+		if path = strings.TrimSpace(path); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+// loadIPRateLimitOverrides loads every config file in order. Earlier files
+// take precedence: the limiter applies the first override whose range
+// contains the client IP.
+func loadIPRateLimitOverrides(paths []string) ([]redirect.IPRateLimitOverride, error) {
+	var overrides []redirect.IPRateLimitOverride
+	for _, path := range paths {
+		loaded, err := redirect.LoadIPRateLimitOverrides(path)
+		if err != nil {
+			return nil, err
+		}
+		overrides = append(overrides, loaded...)
+	}
+	return overrides, nil
 }
 
 func flagWasSet(name string) bool {

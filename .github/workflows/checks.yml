@@ -29,6 +29,7 @@ jobs:
           dagger --cloud checks
 
       - name: Publish
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}

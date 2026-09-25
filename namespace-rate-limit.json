@@ -1,0 +1,10 @@
+{
+  "rate_limit": {
+    "requests_per_minute": 480,
+    "burst": 960
+  },
+  "ip_ranges": [
+    "64.6.39.249/32",
+    "64.6.39.250/32"
+  ]
+}

@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,87 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+// timeoutError is what a stalled upstream looks like to http.Client: the
+// transport error is wrapped in *url.Error, whose Timeout() delegates here.
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// okUpstream serves a 200 manifest for any path and an anonymous token for
+// /token, counting every call so limiter tests can assert exactly how many
+// requests reached GHCR.
+func okUpstream(calls *atomic.Int32) roundTripFunc {
+	return func(r *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		if r.URL.Path == "/token" {
+			return upstreamResponse(http.StatusOK, http.Header{
+				"Content-Type": {"application/json"},
+			}, `{"token":"test"}`), nil
+		}
+		return upstreamResponse(http.StatusOK, http.Header{
+			"Content-Type":          {"application/vnd.oci.image.index.v1+json"},
+			"Docker-Content-Digest": {"sha256:abc"},
+			"Etag":                  {`"sha256:abc"`},
+		}, `{"schemaVersion":2}`), nil
+	}
+}
+
+// limitedRedirect wires a fake upstream to a limiter with a tiny bucket.
+// RequestsPerMinute is 1, so refills are negligible within a test. A
+// cacheBytes of 0 disables the manifest cache so every request is cold.
+func limitedRedirect(transport http.RoundTripper, burst int, cacheBytes int64, tracker *redirect.RateLimitedIPTracker, overrides ...redirect.IPRateLimitOverride) http.Handler {
+	return redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
+		Transport: transport,
+		RateLimit: redirect.RateLimitOptions{
+			RequestsPerMinute: 1,
+			Burst:             burst,
+			IdleTTL:           time.Minute,
+			MaxIPs:            10,
+			LimitedIPs:        tracker,
+			IPOverrides:       overrides,
+		},
+		ManifestCache: redirect.ManifestCacheOptions{
+			Disabled: cacheBytes == 0,
+			MaxBytes: cacheBytes,
+		},
+		BlobCache: redirect.BlobCacheOptions{Disabled: true},
+		// Limiter tests reason about charges per upstream call; keep the
+		// token and /v2 caches out of it so every request is a real fetch.
+		TokenCache: redirect.TokenCacheOptions{Disabled: true},
+		V2Cache:    redirect.V2CacheOptions{Disabled: true},
+	})
+}
+
+func manifestFrom(ip, ref string, withAuth bool) *http.Request {
+	req := manifestRequest(http.MethodGet, ref, "application/vnd.oci.image.index.v1+json", withAuth)
+	req.RemoteAddr = ip + ":1234"
+	return req
+}
+
+// assertRateLimited checks the full 429 contract: status, Retry-After, the
+// JSON body registry clients key off, and that X-Redirected is absent since
+// the request was never forwarded.
+func assertRateLimited(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusTooManyRequests)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+	if !strings.Contains(rec.Body.String(), "TOOMANYREQUESTS") {
+		t.Fatalf("rate-limit body = %q", rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Redirected"); got != "" {
+		t.Fatalf("429 carries X-Redirected = %q, but the request was never forwarded", got)
+	}
 }
 
 func upstreamResponse(status int, header http.Header, body string) *http.Response {
@@ -297,74 +379,42 @@ func TestManifestCacheEvictsLRUWithinByteCap(t *testing.T) {
 }
 
 func TestIPRateLimiterRejectsNoisyClients(t *testing.T) {
-	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
-		RateLimit: redirect.RateLimitOptions{
-			RequestsPerMinute: 1,
-			Burst:             2,
-			IdleTTL:           time.Minute,
-			MaxIPs:            10,
-		},
-		ManifestCache: redirect.ManifestCacheOptions{
-			Disabled: true,
-		},
-	})
+	var calls atomic.Int32
+	handler := limitedRedirect(okUpstream(&calls), 2, 0, nil)
 
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		req.RemoteAddr = "203.0.113.1:1234"
-		handler.ServeHTTP(rec, req)
-		if rec.Code != http.StatusTemporaryRedirect {
-			t.Fatalf("request %d status = %d, want %d", i, rec.Code, http.StatusTemporaryRedirect)
+		handler.ServeHTTP(rec, manifestFrom("203.0.113.1", "v1", true))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d status = %d, want %d", i, rec.Code, http.StatusOK)
 		}
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "203.0.113.1:1234"
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("limited status = %d, want %d", rec.Code, http.StatusTooManyRequests)
-	}
-	if got := rec.Header().Get("Retry-After"); got != "1" {
-		t.Fatalf("Retry-After = %q, want 1", got)
-	}
-	if !strings.Contains(rec.Body.String(), "TOOMANYREQUESTS") {
-		t.Fatalf("rate-limit body = %q", rec.Body.String())
+	handler.ServeHTTP(rec, manifestFrom("203.0.113.1", "v1", true))
+	assertRateLimited(t, rec)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2: the refused request was forwarded", got)
 	}
 }
 
 func TestIPRateLimiterRecordsRateLimitedClients(t *testing.T) {
+	var calls atomic.Int32
 	tracker := redirect.NewRateLimitedIPTracker(50)
-	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
-		RateLimit: redirect.RateLimitOptions{
-			RequestsPerMinute: 1,
-			Burst:             1,
-			IdleTTL:           time.Minute,
-			MaxIPs:            10,
-			LimitedIPs:        tracker,
-		},
-		ManifestCache: redirect.ManifestCacheOptions{
-			Disabled: true,
-		},
-	})
+	handler := limitedRedirect(okUpstream(&calls), 1, 0, tracker)
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "203.0.113.10:1234"
 	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("first status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
+	handler.ServeHTTP(rec, manifestFrom("203.0.113.10", "v1", true))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", rec.Code, http.StatusOK)
 	}
 	if got := tracker.TopMap(); len(got) != 0 {
 		t.Fatalf("tracker after allowed request = %#v, want empty", got)
 	}
 
 	for i := 0; i < 2; i++ {
-		req = httptest.NewRequest(http.MethodGet, "/", nil)
-		req.RemoteAddr = "203.0.113.10:1234"
 		rec = httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
+		handler.ServeHTTP(rec, manifestFrom("203.0.113.10", "v1", true))
 		if rec.Code != http.StatusTooManyRequests {
 			t.Fatalf("limited request %d status = %d, want %d", i, rec.Code, http.StatusTooManyRequests)
 		}
@@ -377,112 +427,61 @@ func TestIPRateLimiterRecordsRateLimitedClients(t *testing.T) {
 }
 
 func TestIPRateLimiterUsesOverrideForConfiguredIPRanges(t *testing.T) {
-	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
-		RateLimit: redirect.RateLimitOptions{
-			RequestsPerMinute: 1,
-			Burst:             1,
-			IdleTTL:           time.Minute,
-			MaxIPs:            10,
-			IPOverrides: []redirect.IPRateLimitOverride{{
-				RequestsPerMinute: 2,
-				Burst:             2,
-				IPPrefixes: []netip.Prefix{
-					netip.MustParsePrefix("203.0.113.0/24"),
-				},
-			}},
-		},
-		ManifestCache: redirect.ManifestCacheOptions{
-			Disabled: true,
-		},
+	var calls atomic.Int32
+	handler := limitedRedirect(okUpstream(&calls), 1, 0, nil, redirect.IPRateLimitOverride{
+		RequestsPerMinute: 2,
+		Burst:             2,
+		IPPrefixes:        []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")},
 	})
 
 	for i := 0; i < 2; i++ {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		req.RemoteAddr = "203.0.113.10:1234"
-		handler.ServeHTTP(rec, req)
-		if rec.Code != http.StatusTemporaryRedirect {
-			t.Fatalf("configured request %d status = %d, want %d", i, rec.Code, http.StatusTemporaryRedirect)
+		handler.ServeHTTP(rec, manifestFrom("203.0.113.10", "v1", true))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("configured request %d status = %d, want %d", i, rec.Code, http.StatusOK)
 		}
 	}
-
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "203.0.113.10:1234"
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("configured limited status = %d, want %d", rec.Code, http.StatusTooManyRequests)
-	}
+	handler.ServeHTTP(rec, manifestFrom("203.0.113.10", "v1", true))
+	assertRateLimited(t, rec)
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "198.51.100.10:1234"
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("default first status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
+	handler.ServeHTTP(rec, manifestFrom("198.51.100.10", "v1", true))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default first status = %d, want %d", rec.Code, http.StatusOK)
 	}
-
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "198.51.100.10:1234"
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("default limited status = %d, want %d", rec.Code, http.StatusTooManyRequests)
-	}
+	handler.ServeHTTP(rec, manifestFrom("198.51.100.10", "v1", true))
+	assertRateLimited(t, rec)
 }
 
 func TestIPRateLimiterSkipsBlobRequests(t *testing.T) {
-	calls := 0
-	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
-		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			calls++
-			if !strings.Contains(r.URL.Path, "/blobs/") {
-				t.Fatalf("upstream path = %q, want blob request", r.URL.Path)
-			}
+	var calls atomic.Int32
+	ok := okUpstream(&calls)
+	handler := limitedRedirect(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "/blobs/") {
+			calls.Add(1)
 			return upstreamResponse(http.StatusTemporaryRedirect, http.Header{
 				"Location": {"https://example.test/blob"},
 			}, ""), nil
-		}),
-		RateLimit: redirect.RateLimitOptions{
-			RequestsPerMinute: 1,
-			Burst:             1,
-			IdleTTL:           time.Minute,
-			MaxIPs:            10,
-		},
-		ManifestCache: redirect.ManifestCacheOptions{
-			Disabled: true,
-		},
-	})
+		}
+		return ok(r)
+	}), 1, 0, nil)
 
-	for i := 0; i < 3; i++ {
-		rec := httptest.NewRecorder()
+	// Blobs are exempt even on a cold cache, including concurrent requests.
+	counts := burstRequests(t, handler, 20, func(int) *http.Request {
 		req := httptest.NewRequest(http.MethodGet, "/v2/engine/blobs/sha256:abc", nil)
 		req.RemoteAddr = "203.0.113.1:1234"
 		req.Header.Set("Authorization", "Bearer test")
-		handler.ServeHTTP(rec, req)
-		if rec.Code != http.StatusTemporaryRedirect {
-			t.Fatalf("blob request %d status = %d, want %d", i, rec.Code, http.StatusTemporaryRedirect)
-		}
-	}
-	if calls != 3 {
-		t.Fatalf("upstream blob calls = %d, want 3", calls)
+		return req
+	})
+	if counts[http.StatusTemporaryRedirect] != 20 || calls.Load() != 20 {
+		t.Fatalf("blob burst: statuses=%v upstream=%d, want 20 redirects and 20 upstream calls", counts, calls.Load())
 	}
 
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "203.0.113.1:1234"
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("first non-blob status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
-	}
-
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "203.0.113.1:1234"
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("second non-blob status = %d, want %d", rec.Code, http.StatusTooManyRequests)
-	}
+	// The bucket is untouched: one manifest gets through, the next is refused.
+	serveRequest(t, handler, manifestFrom("203.0.113.1", "v1", true), http.StatusOK)
+	assertRateLimited(t, serveRequest(t, handler, manifestFrom("203.0.113.1", "v2", true), http.StatusTooManyRequests))
 }
 
 func TestBlobRedirectCacheCachesSignedGETRedirects(t *testing.T) {
@@ -610,45 +609,27 @@ func TestBlobRedirectCacheSkipsRedirectsTooCloseToExpiry(t *testing.T) {
 }
 
 func TestIPRateLimiterUsesFlyClientIPBeforeForwardedHeaders(t *testing.T) {
-	handler := redirect.NewWithOptions("ghcr.io", "dagger", "", redirect.Options{
-		RateLimit: redirect.RateLimitOptions{
-			RequestsPerMinute: 1,
-			Burst:             1,
-			IdleTTL:           time.Minute,
-			MaxIPs:            10,
-		},
-		ManifestCache: redirect.ManifestCacheOptions{
-			Disabled: true,
-		},
-	})
+	var calls atomic.Int32
+	handler := limitedRedirect(okUpstream(&calls), 1, 0, nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "192.0.2.1:1234"
-	req.Header.Set("Fly-Client-IP", "203.0.113.10")
-	req.Header.Set("X-Forwarded-For", "198.51.100.10")
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("first status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
+	send := func(remote, flyIP, forwarded string) *httptest.ResponseRecorder {
+		req := manifestFrom(remote, "v1", true)
+		req.Header.Set("Fly-Client-IP", flyIP)
+		req.Header.Set("X-Forwarded-For", forwarded)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "192.0.2.2:1234"
-	req.Header.Set("Fly-Client-IP", "203.0.113.10")
-	req.Header.Set("X-Forwarded-For", "198.51.100.11")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("same Fly-Client-IP status = %d, want %d", rec.Code, http.StatusTooManyRequests)
+	if rec := send("192.0.2.1", "203.0.113.10", "198.51.100.10"); rec.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", rec.Code, http.StatusOK)
 	}
-
-	req = httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "192.0.2.1:1234"
-	req.Header.Set("Fly-Client-IP", "203.0.113.11")
-	req.Header.Set("X-Forwarded-For", "198.51.100.10")
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("different Fly-Client-IP status = %d, want %d", rec.Code, http.StatusTemporaryRedirect)
+	// Same Fly-Client-IP with a different RemoteAddr and X-Forwarded-For
+	// lands in the same bucket.
+	assertRateLimited(t, send("192.0.2.2", "203.0.113.10", "198.51.100.11"))
+	// A different Fly-Client-IP with the same RemoteAddr and X-Forwarded-For
+	// gets its own bucket.
+	if rec := send("192.0.2.1", "203.0.113.11", "198.51.100.10"); rec.Code != http.StatusOK {
+		t.Fatalf("different Fly-Client-IP status = %d, want %d", rec.Code, http.StatusOK)
 	}
 }

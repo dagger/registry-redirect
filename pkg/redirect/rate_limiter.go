@@ -54,23 +54,26 @@ func newIPRateLimiter(opts RateLimitOptions) *ipRateLimiter {
 	}
 }
 
-func (l *ipRateLimiter) wrap(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isBlobRequest(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
-		ip := clientIP(r)
-		if !l.allow(ip) {
-			l.limitedIPs.Record(ip)
-			w.Header().Set("Content-Type", "application/json")
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"errors":[{"code":"TOOMANYREQUESTS","message":"request rate limit exceeded"}]}`))
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// allowRequest charges a cache miss once, before the handler makes any
+// upstream calls. Blob requests remain exempt even on a cache miss.
+func (l *ipRateLimiter) allowRequest(r *http.Request) bool {
+	if l == nil || isBlobRequest(r) {
+		return true
+	}
+	ip := clientIP(r)
+	if l.allow(ip) {
+		return true
+	}
+	l.limitedIPs.Record(ip)
+	return false
+}
+
+// writeRateLimited preserves the registry error body and retry header.
+func writeRateLimited(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = w.Write([]byte(`{"errors":[{"code":"TOOMANYREQUESTS","message":"request rate limit exceeded"}]}`))
 }
 
 func isBlobRequest(r *http.Request) bool {

@@ -13,6 +13,11 @@ const (
 	defaultManifestCacheMaxBytes      = 256 * 1024 * 1024
 	defaultBlobCacheMaxBytes          = 512 * 1024 * 1024
 	defaultBackendRequestTimeout      = 5 * time.Second
+
+	// Retain more idle upstream connections between bursts to reduce connection
+	// churn. MaxIdleConnsPerHost does not limit active connections.
+	defaultTransportMaxIdleConns        = 200
+	defaultTransportMaxIdleConnsPerHost = 100
 )
 
 type Options struct {
@@ -21,6 +26,20 @@ type Options struct {
 	RateLimit     RateLimitOptions
 	ManifestCache ManifestCacheOptions
 	BlobCache     BlobCacheOptions
+	TokenCache    TokenCacheOptions
+	V2Cache       V2CacheOptions
+}
+
+// TokenCacheOptions controls anonymous token caching for both the client
+// /token endpoint and the tokens the proxy fetches for itself.
+type TokenCacheOptions struct {
+	Disabled bool
+}
+
+// V2CacheOptions controls the cache of the upstream /v2/ answer, which is a
+// constant challenge for anonymous callers.
+type V2CacheOptions struct {
+	Disabled bool
 }
 
 type RateLimitOptions struct {
@@ -43,8 +62,18 @@ type BlobCacheOptions struct {
 	MaxBytes int64
 }
 
+// defaultTransport clones http.DefaultTransport so its proxy, dialer and TLS
+// settings carry over, then raises the idle connection limits. It never
+// mutates the shared global.
+func defaultTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = defaultTransportMaxIdleConns
+	transport.MaxIdleConnsPerHost = defaultTransportMaxIdleConnsPerHost
+	return transport
+}
+
 func DefaultOptions() Options {
-	transport := http.DefaultTransport
+	transport := defaultTransport()
 	return Options{
 		Transport: transport,
 		Client: &http.Client{
@@ -72,7 +101,11 @@ func (o Options) withDefaults() Options {
 		o.Transport = defaults.Transport
 	}
 	if o.Client == nil {
-		o.Client = defaults.Client
+		// Use the supplied transport for every upstream path.
+		o.Client = &http.Client{
+			Transport: o.Transport,
+			Timeout:   defaultBackendRequestTimeout,
+		}
 	} else if o.Client.Timeout == 0 {
 		client := *o.Client
 		client.Timeout = defaultBackendRequestTimeout

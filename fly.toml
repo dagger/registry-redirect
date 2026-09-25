@@ -16,7 +16,7 @@ processes = [ "app" ]
 
 [experimental]
 auto_rollback = true
-cmd = [ "-repo", "dagger" ]
+cmd = [ "-repo", "dagger", "-ip-rate-limit-config", "github-actions-rate-limit.json,namespace-rate-limit.json" ]
 
   [experimental.attached]
   secrets = { }
